@@ -33,8 +33,8 @@ DEPOSIT_FIXED = 500
 MAX_PHOTOS = 10
 BOT_USERNAME = "mizimarketbot"
 
-SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key-change-me")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+SECRET_KEY = os.getenv("mizimiziqwerty1234521599521", "super-secret-key-change-me")
+ADMIN_PASSWORD = os.getenv("mizimiziqwerty1234521599521mizimiziqwerty1234521599521", "admin123")
 
 STATIC_DIR = Path('/app/static/items')
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
