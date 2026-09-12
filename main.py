@@ -26,7 +26,7 @@ from flask_cors import CORS
 import jwt
 
 # ========== КОНФИГУРАЦИЯ ==========
-TOKEN = os.getenv("TOKEN", "8020809344:AAGQ4-n_aOgN7tQNfnpI8laW16qWXwN5p9c")
+TOKEN = os.getenv("TOKEN", "8020809344:AAGkPqjGKSvTMdQWv5UyE7EiV-zQaUwWUaQ")
 ADMIN_IDS = [int(id) for id in os.getenv("ADMIN_IDS", "6392591727").split(",")]
 CHANNEL_ID = os.getenv("CHANNEL_ID", "-1003275553562")
 DEPOSIT_FIXED = 500
