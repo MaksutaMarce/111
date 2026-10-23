@@ -1,10 +1,7 @@
 import logging
 import sqlite3
-import os
-import uuid
-from datetime import datetime, timedelta
-from pathlib import Path
-from threading import Thread
+from datetime import datetime
+from typing import List, Optional, Tuple
 
 from telegram import (
     Update,
@@ -21,202 +18,15 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler
 )
-from flask import Flask, request, jsonify, g, send_from_directory
-from flask_cors import CORS
-import jwt
 
 # ========== КОНФИГУРАЦИЯ ==========
-TOKEN = os.getenv("TOKEN", "8020809344:AAEPXzXO3BgOwsPbYhqIx9v01XaByv7fXw8")
-ADMIN_IDS = [int(id) for id in os.getenv("ADMIN_IDS", "6392591727").split(",")]
-CHANNEL_ID = os.getenv("CHANNEL_ID", "-1003275553562")
-DEPOSIT_FIXED = 500
-MAX_PHOTOS = 10
-BOT_USERNAME = "mizimarketbot"
-
-SECRET_KEY = os.getenv("mizimiziqwerty1234521599521", "super-secret-key-change-me")
-ADMIN_PASSWORD = os.getenv("mizimiziqwerty1234521599521mizimiziqwerty1234521599521", "admin123")
-
-STATIC_DIR = Path('/app/static/items')
-STATIC_DIR.mkdir(parents=True, exist_ok=True)
-DATABASE = '/app/data/apple_store.db'
-
-# ========== FLASK API ==========
-flask_app = Flask(__name__)
-CORS(flask_app)
-
-def get_db():
-    db = getattr(g, '_database', None)
-    if db is None:
-        db = g._database = sqlite3.connect(DATABASE)
-        db.row_factory = sqlite3.Row
-    return db
-
-@flask_app.teardown_appcontext
-def close_connection(exception):
-    db = getattr(g, '_database', None)
-    if db is not None:
-        db.close()
-
-def query_db(query, args=(), one=False):
-    cur = get_db().execute(query, args)
-    rv = cur.fetchall()
-    cur.close()
-    return (rv[0] if rv else None) if one else rv
-
-def commit_db():
-    get_db().commit()
-
-def token_required(f):
-    from functools import wraps
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = request.headers.get('Authorization')
-        if not token:
-            return jsonify({'message': 'Требуется токен'}), 401
-        try:
-            token = token.split()[1]
-            data = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
-            g.admin_id = data['sub']
-        except:
-            return jsonify({'message': 'Неверный токен'}), 401
-        return f(*args, **kwargs)
-    return decorated
-
-@flask_app.route('/api/auth/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    if not data or data.get('password') != ADMIN_PASSWORD:
-        return jsonify({'message': 'Неверный пароль'}), 401
-    token = jwt.encode({
-        'sub': 'admin',
-        'exp': datetime.utcnow() + timedelta(hours=24)
-    }, SECRET_KEY, algorithm='HS256')
-    return jsonify({'token': token})
-
-@flask_app.route('/api/items')
-def get_items():
-    page = request.args.get('page', 1, type=int)
-    limit = 20
-    offset = (page - 1) * limit
-    category = request.args.get('category')
-    search = request.args.get('search')
-    status = request.args.get('status', 'available')
-
-    query = "SELECT * FROM lots WHERE status = ?"
-    params = [status]
-    if category:
-        query += " AND category = ?"
-        params.append(category)
-    if search:
-        query += " AND (name LIKE ? OR description LIKE ?)"
-        params.extend([f'%{search}%', f'%{search}%'])
-
-    query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
-    items = [dict(row) for row in query_db(query, params)]
-
-    count_query = "SELECT COUNT(*) as count FROM lots WHERE status = ?"
-    count_params = [status]
-    if category:
-        count_query += " AND category = ?"
-        count_params.append(category)
-    if search:
-        count_query += " AND (name LIKE ? OR description LIKE ?)"
-        count_params.extend([f'%{search}%', f'%{search}%'])
-    total = query_db(count_query, count_params, one=True)['count']
-
-    return jsonify({
-        'items': items,
-        'total': total,
-        'page': page,
-        'pages': (total + limit - 1) // limit
-    })
-
-@flask_app.route('/api/items/<lot_id>')
-def get_item(lot_id):
-    item = query_db("SELECT * FROM lots WHERE lot_id = ?", [lot_id], one=True)
-    if item is None:
-        return jsonify({'error': 'Товар не найден'}), 404
-    return jsonify(dict(item))
-
-@flask_app.route('/api/admin/items', methods=['GET'])
-@token_required
-def admin_get_items():
-    items = query_db("SELECT * FROM lots ORDER BY created_at DESC LIMIT 200")
-    return jsonify([dict(row) for row in items])
-
-@flask_app.route('/api/admin/items', methods=['POST'])
-@token_required
-def admin_create_item():
-    data = request.get_json()
-    if not all(k in data for k in ('name', 'price', 'category')):
-        return jsonify({'error': 'Не все поля'}), 400
-    db = get_db()
-    cur = db.execute("SELECT value FROM counters WHERE name='lot_counter'")
-    row = cur.fetchone()
-    next_num = row[0] + 1
-    db.execute("UPDATE counters SET value=? WHERE name='lot_counter'", (next_num,))
-    db.commit()
-    lot_id = f"MIZI-MARKET {next_num}"
-    photos_str = ','.join(data.get('photos', []))
-    db.execute('''INSERT INTO lots (lot_id, name, description, price, photos, category, status)
-                  VALUES (?,?,?,?,?,?,?)''',
-               (lot_id, data['name'], data.get('description',''), data['price'],
-                photos_str, data['category'], 'available'))
-    db.commit()
-    return jsonify({'lot_id': lot_id, 'message': 'Создан'}), 201
-
-@flask_app.route('/api/admin/items/<lot_id>', methods=['PUT'])
-@token_required
-def admin_update_item(lot_id):
-    data = request.get_json()
-    db = get_db()
-    fields = []
-    params = []
-    for f in ['name', 'description', 'price', 'category', 'status']:
-        if f in data:
-            fields.append(f"{f}=?")
-            params.append(data[f])
-    if 'photos' in data:
-        fields.append("photos=?")
-        params.append(','.join(data['photos']))
-    if not fields:
-        return jsonify({'error': 'Нет полей'}), 400
-    params.append(lot_id)
-    db.execute(f"UPDATE lots SET {', '.join(fields)} WHERE lot_id=?", params)
-    db.commit()
-    return jsonify({'message': 'Обновлено'})
-
-@flask_app.route('/api/admin/items/<lot_id>', methods=['DELETE'])
-@token_required
-def admin_delete_item(lot_id):
-    db = get_db()
-    db.execute("DELETE FROM lots WHERE lot_id=?", [lot_id])
-    db.commit()
-    return jsonify({'message': 'Удалено'})
-
-@flask_app.route('/api/admin/upload', methods=['POST'])
-@token_required
-def upload_photo():
-    if 'file' not in request.files:
-        return jsonify({'error': 'Нет файла'}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'Имя файла пустое'}), 400
-    ext = os.path.splitext(file.filename)[1]
-    filename = f"{uuid.uuid4()}{ext}"
-    save_path = STATIC_DIR / filename
-    file.save(str(save_path))
-    return jsonify({'path': f"static/items/{filename}"}), 201
-
-@flask_app.route('/static/items/<path:filename>')
-def static_files(filename):
-    return send_from_directory(STATIC_DIR, filename)
-
-def run_flask():
-    flask_app.run(host='0.0.0.0', port=5000, debug=False)
-
-# ========== ЛОГИРОВАНИЕ ==========
+TOKEN = "8020809344:AAEPXzXO3BgOwsPbYhqIx9v01XaByv7fXw8"
+ADMIN_IDS = [6392591727]
+CHANNEL_ID = "-1003275553562"
+DEPOSIT_FIXED = 500  # Фиксированная предоплата 500 рублей
+MAX_PHOTOS = 10  # Максимальное количество фото на товар
+BOT_USERNAME = "mizimarketbot"  # Имя бота для ссылок
+# ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
@@ -226,8 +36,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-# ========== КАТЕГОРИИ И СТАТУСЫ ==========
+# ========== КАТЕГОРИИ ТОВАРОВ ==========
 CATEGORIES = {
     'phones': '📱 Смартфоны',
     'laptops': '💻 Ноутбуки',
@@ -244,6 +53,7 @@ CATEGORY_EMOJIS = {
     'accessories': '🎧',
     'audio': '🎵'
 }
+# ========== СТАТУСЫ ==========
 STATUSES = {
     'available': {'text': '✅ АКТУАЛЬНО', 'emoji': '✅'},
     'reserved': {'text': '🔄 Забронирован', 'emoji': '🔄'},
@@ -252,8 +62,7 @@ STATUSES = {
     'approved': {'text': '✅ Подтвержден', 'emoji': '✅'},
     'rejected': {'text': '❌ Отклонен', 'emoji': '❌'}
 }
-
-# ========== СОСТОЯНИЯ РАЗГОВОРА ==========
+# ========== СОСТОЯНИЯ ДЛЯ РАЗГОВОРА ==========
 (
     DEVICE_MODEL, DEVICE_CONDITION, DEVICE_DESCRIPTION,
     DEVICE_LOCATION, DEVICE_CONTACT, DEVICE_PHOTOS,
@@ -261,68 +70,117 @@ STATUSES = {
     LOT_CATEGORY, LOT_EDIT_FIELD, SEARCH
 ) = range(13)
 
-# ========== РАБОТА С БД (ОРИГИНАЛЬНЫЙ КЛАСС) ==========
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 class Database:
+    """Класс для работы с базой данных"""
+
     def __init__(self):
-        self.conn = sqlite3.connect(DATABASE, check_same_thread=False)
+        self.conn = sqlite3.connect('apple_store.db', check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.init_db()
 
     def init_db(self):
         cursor = self.conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER DEFAULT 0)''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS lots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lot_id TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            description TEXT,
-            price REAL NOT NULL,
-            photos TEXT,
-            category TEXT NOT NULL,
-            status TEXT DEFAULT 'available',
-            views INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            channel_message_id INTEGER
-        )''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lot_id TEXT, user_id INTEGER, user_name TEXT, user_username TEXT,
-            screenshot TEXT, status TEXT DEFAULT 'pending',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(lot_id) REFERENCES lots(lot_id)
-        )''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS buyback_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER, user_name TEXT, user_username TEXT,
-            device_model TEXT NOT NULL, device_condition TEXT NOT NULL,
-            description TEXT, photos TEXT, location TEXT,
-            contact_info TEXT NOT NULL, status TEXT DEFAULT 'pending',
-            estimated_price REAL, notes TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
-            last_name TEXT, is_admin BOOLEAN DEFAULT FALSE,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_active DATETIME DEFAULT CURRENT_TIMESTAMP
-        )''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS views (
-            user_id INTEGER, lot_id TEXT,
-            viewed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY(user_id, lot_id)
-        )''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS favorites (
-            user_id INTEGER, lot_id TEXT,
-            added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY(user_id, lot_id)
-        )''')
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_lots_status ON lots(status)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_lots_category ON lots(category)")
+        # Таблица счетчиков
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS counters (
+                name TEXT PRIMARY KEY,
+                value INTEGER DEFAULT 0
+            )
+        ''')
+        # Таблица товаров
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS lots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lot_id TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                price REAL NOT NULL,
+                photos TEXT,
+                category TEXT NOT NULL,
+                status TEXT DEFAULT 'available',
+                views INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                channel_message_id INTEGER
+            )
+        ''')
+        # Таблица заказов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lot_id TEXT,
+                user_id INTEGER,
+                user_name TEXT,
+                user_username TEXT,
+                screenshot TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(lot_id) REFERENCES lots(lot_id)
+            )
+        ''')
+        # Таблица заявок на выкуп
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS buyback_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                user_name TEXT,
+                user_username TEXT,
+                device_model TEXT NOT NULL,
+                device_condition TEXT NOT NULL,
+                description TEXT,
+                photos TEXT,
+                location TEXT,
+                contact_info TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                estimated_price REAL,
+                notes TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # Таблица пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                is_admin BOOLEAN DEFAULT FALSE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_active DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # Таблица просмотров
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS views (
+                user_id INTEGER,
+                lot_id TEXT,
+                viewed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, lot_id)
+            )
+        ''')
+        # Таблица избранного
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS favorites (
+                user_id INTEGER,
+                lot_id TEXT,
+                added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, lot_id)
+            )
+        ''')
+        # Индексы для оптимизации
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_lots_status ON lots(status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_lots_category ON lots(category)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_buyback_status ON buyback_requests(status)')
         cursor.execute("INSERT OR IGNORE INTO counters (name, value) VALUES ('lot_counter', 0)")
-        self.conn.commit()
 
-    def get_next_lot_number(self):
+        self.conn.commit()
+        logger.info("✅ База данных инициализирована")
+
+    def get_next_lot_number(self) -> int:
+        """Получает следующий номер для артикула"""
         cursor = self.conn.cursor()
         cursor.execute("SELECT value FROM counters WHERE name = 'lot_counter'")
         result = cursor.fetchone()
@@ -332,19 +190,19 @@ class Database:
         self.conn.commit()
         return next_number
 
-    def execute(self, query, params=()):
+    def execute(self, query: str, params: tuple = ()):
         cursor = self.conn.cursor()
         cursor.execute(query, params)
         self.conn.commit()
         return cursor
 
-    def fetchone(self, query, params=()):
+    def fetchone(self, query: str, params: tuple = ()):
         cursor = self.conn.cursor()
         cursor.execute(query, params)
         result = cursor.fetchone()
         return dict(result) if result else None
 
-    def fetchall(self, query, params=()):
+    def fetchall(self, query: str, params: tuple = ()):
         cursor = self.conn.cursor()
         cursor.execute(query, params)
         results = cursor.fetchall()
@@ -353,49 +211,56 @@ class Database:
     def close(self):
         self.conn.close()
 
+
 db = Database()
 
-def generate_lot_id():
+
+def generate_lot_id() -> str:
+    """Генерирует уникальный ID для лота"""
     lot_number = db.get_next_lot_number()
     return f"MIZI-MARKET {lot_number}"
 
-def format_price(price):
+
+def format_price(price: float) -> str:
+    """Форматирует цену с разделителями"""
     return f"{price:,.0f}".replace(",", " ")
 
-def validate_price(price_str):
+
+def validate_price(price_str: str) -> Tuple[bool, Optional[float]]:
+    """Проверяет корректность цены"""
     try:
         price = float(price_str.replace(',', '.').replace(' ', ''))
-        if price < 100: return False, None
+        if price < 100:
+            return False, None
         return True, price
     except ValueError:
         return False, None
 
-def split_list(lst, n):
+
+def split_list(lst: List, n: int) -> List[List]:
+    """Разделяет список на части по n элементов"""
     return [lst[i:i + n] for i in range(0, len(lst), n)]
 
-def get_channel_tag(status):
-    if status == 'available': return '✅ #АКТУАЛЬНО'
-    elif status == 'reserved': return '🔄 #ЗАБРОНИРОВАН'
-    elif status == 'sold': return '❌ #ПРОДАН'
+
+def get_channel_tag(status: str) -> str:
+    if status == 'available':
+        return '✅ #АКТУАЛЬНО'
+    elif status == 'reserved':
+        return '🔄 #ЗАБРОНИРОВАН'
+    elif status == 'sold':
+        return '❌ #ПРОДАН'
     return ''
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-async def download_photo(file_id, context):
-    """Скачивает фото из Telegram и возвращает относительный путь static/items/..."""
-    file = await context.bot.get_file(file_id)
-    ext = os.path.splitext(file.file_path)[1] or '.jpg'
-    filename = f"{uuid.uuid4()}{ext}"
-    local_path = STATIC_DIR / filename
-    await file.download_to_drive(custom_path=local_path)
-    return f"static/items/{filename}"
 
+# Helper function to smart edit message
 async def edit_message_smart(query, text, reply_markup=None, parse_mode=None):
     if query.message.photo:
         await query.edit_message_caption(caption=text, reply_markup=reply_markup, parse_mode=parse_mode)
     else:
         await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
 
-async def update_channel_caption(context, lot):
+
+async def update_channel_caption(context: ContextTypes.DEFAULT_TYPE, lot: dict):
     if lot['channel_message_id']:
         try:
             balance = lot['price'] - DEPOSIT_FIXED
@@ -420,7 +285,7 @@ async def update_channel_caption(context, lot):
 ❌Имеется недостаток товара: невозможно установить и использовать RuStore
 
 {get_channel_tag(lot['status'])}
-💬 @mizirf
+💬 @MaksutaMarce
             """
             await context.bot.edit_message_caption(
                 chat_id=CHANNEL_ID,
@@ -431,8 +296,10 @@ async def update_channel_caption(context, lot):
         except Exception as e:
             logger.error(f"Ошибка обновления канала: {e}")
 
+
 # ========== КЛАВИАТУРЫ ==========
-def main_menu_keyboard(user_id):
+def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура главного меню"""
     keyboard = [
         [InlineKeyboardButton("🛍️ Магазин", callback_data="shop"),
          InlineKeyboardButton("📦 Мои заказы", callback_data="my_orders")],
@@ -446,7 +313,9 @@ def main_menu_keyboard(user_id):
         keyboard.append([InlineKeyboardButton("⚙️ Админ панель", callback_data="admin_panel")])
     return InlineKeyboardMarkup(keyboard)
 
-def admin_menu_keyboard():
+
+def admin_menu_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура админ-панели"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить товар", callback_data="add_lot"),
          InlineKeyboardButton("📊 Статистика", callback_data="stats")],
@@ -457,9 +326,12 @@ def admin_menu_keyboard():
         [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
     ])
 
-def shop_keyboard():
+
+def shop_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура магазина"""
     keyboard = []
     categories = list(CATEGORIES.items())
+    # Создаем кнопки категорий в 2 колонки
     for i in range(0, len(categories), 2):
         row = []
         if i < len(categories):
@@ -469,6 +341,7 @@ def shop_keyboard():
             cat_id, cat_name = categories[i + 1]
             row.append(InlineKeyboardButton(cat_name, callback_data=f"category_{cat_id}"))
         keyboard.append(row)
+
     keyboard.extend([
         [InlineKeyboardButton("🔍 Все товары", callback_data="all_items")],
         [InlineKeyboardButton("⭐ Популярные", callback_data="popular")],
@@ -477,7 +350,9 @@ def shop_keyboard():
     ])
     return InlineKeyboardMarkup(keyboard)
 
-def category_keyboard(category, page=0, total_pages=1):
+
+def category_keyboard(category: str, page: int = 0, total_pages: int = 1) -> InlineKeyboardMarkup:
+    """Клавиатура категории с пагинацией"""
     keyboard = []
     pagination = []
     if page > 0:
@@ -487,18 +362,23 @@ def category_keyboard(category, page=0, total_pages=1):
         pagination.append(InlineKeyboardButton("Вперед →", callback_data=f"cat_next_{category}_{page}"))
     if pagination:
         keyboard.append(pagination)
+
     keyboard.append([
         InlineKeyboardButton("🛍️ Все категории", callback_data="shop"),
         InlineKeyboardButton("🏠 В меню", callback_data="main_menu")
     ])
     return InlineKeyboardMarkup(keyboard)
 
-def lot_keyboard(lot_id, status, user_id=None):
+
+def lot_keyboard(lot_id: str, status: str, user_id: int = None) -> InlineKeyboardMarkup:
+    """Клавиатура для товара"""
     keyboard = []
+    # Проверяем, есть ли товар в избранном
     is_favorite = False
     if user_id:
         fav = db.fetchone("SELECT * FROM favorites WHERE user_id = ? AND lot_id = ?", (user_id, lot_id))
         is_favorite = bool(fav)
+
     if status == 'available':
         keyboard.append([
             InlineKeyboardButton("💰 Забронировать", callback_data=f"buy_{lot_id}"),
@@ -508,6 +388,7 @@ def lot_keyboard(lot_id, status, user_id=None):
         keyboard.append([InlineKeyboardButton("🔄 Забронирован", callback_data="noop")])
     elif status == 'sold':
         keyboard.append([InlineKeyboardButton("❌ Продан", callback_data="noop")])
+
     keyboard.append([
         InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_{lot_id}"),
         InlineKeyboardButton("📞 Контакты", url=f"https://t.me/mizirf")
@@ -515,7 +396,9 @@ def lot_keyboard(lot_id, status, user_id=None):
     keyboard.append([InlineKeyboardButton("🛍️ В магазин", callback_data="shop")])
     return InlineKeyboardMarkup(keyboard)
 
-def order_keyboard(order_id):
+
+def order_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура для заказа"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📞 Связаться", callback_data=f"contact_{order_id}"),
          InlineKeyboardButton("🔄 Статус", callback_data=f"status_{order_id}")],
@@ -523,29 +406,41 @@ def order_keyboard(order_id):
         [InlineKeyboardButton("📦 Мои заказы", callback_data="my_orders")]
     ])
 
-def payment_keyboard(lot_id):
+
+def payment_keyboard(lot_id: str) -> InlineKeyboardMarkup:
+    """Клавиатура оплаты"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💳 Перевести 500₽", url=f"https://t.me/mizirf")],
         [InlineKeyboardButton("📸 Отправить скриншот", callback_data=f"pay_{lot_id}")],
         [InlineKeyboardButton("❌ Отмена", callback_data=f"cancel_payment_{lot_id}")]
     ])
 
-def cancel_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data="cancel")]])
 
-def photos_keyboard():
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура отмены"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отменить", callback_data="cancel")]
+    ])
+
+
+def photos_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для загрузки фото"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Готово", callback_data="finish_photos"),
          InlineKeyboardButton("❌ Отмена", callback_data="cancel")]
     ])
 
-def search_keyboard():
+
+def search_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура поиска"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Отмена поиска", callback_data="cancel_search")],
         [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
     ])
 
-def admin_order_action_keyboard(order_id):
+
+def admin_order_action_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура действий администратора для заказа"""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Подтвердить бронь", callback_data=f"admin_approve_{order_id}"),
@@ -557,23 +452,35 @@ def admin_order_action_keyboard(order_id):
         ]
     ])
 
+
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
-async def start(update, context):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
     user = update.effective_user
     user_id = user.id
-    db.execute('''INSERT OR IGNORE INTO users (id, username, first_name, last_name, is_admin)
-                  VALUES (?, ?, ?, ?, ?)''',
-               (user_id, user.username, user.first_name, user.last_name, user_id in ADMIN_IDS))
+
+    # Сохраняем пользователя в БД
+    db.execute('''
+        INSERT OR IGNORE INTO users (id, username, first_name, last_name, is_admin)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, user.username, user.first_name, user.last_name, user_id in ADMIN_IDS))
     db.execute('UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE id = ?', (user_id,))
+
+    # Проверяем наличие параметра (ID товара)
     if context.args:
         lot_id = context.args[0]
         lot = db.fetchone("SELECT * FROM lots WHERE lot_id = ?", (lot_id,))
         if lot:
+            # Увеличиваем счетчик просмотров
             db.execute('UPDATE lots SET views = views + 1 WHERE lot_id = ?', (lot_id,))
-            db.execute('INSERT OR REPLACE INTO views (user_id, lot_id, viewed_at) VALUES (?, ?, CURRENT_TIMESTAMP)',
-                       (user_id, lot_id))
+            db.execute('''
+                INSERT OR REPLACE INTO views (user_id, lot_id, viewed_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            ''', (user_id, lot_id))
             await show_lot(update, context, lot_id)
             return
+
+    # Приветственное сообщение
     welcome_text = f"""
 ✨ *Добро пожаловать в MIZI MARKET, {user.first_name}!* ✨
 
@@ -588,13 +495,16 @@ async def start(update, context):
 
 💫 *Начните прямо сейчас:*
     """
+
     if update.message:
         await update.message.reply_text(welcome_text, reply_markup=main_menu_keyboard(user_id), parse_mode='Markdown')
     else:
         await edit_message_smart(update.callback_query, welcome_text, reply_markup=main_menu_keyboard(user_id),
                                  parse_mode='Markdown')
 
-async def help_command(update, context):
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
     help_text = """
 🆘 *Помощь по боту*
 
@@ -617,30 +527,37 @@ async def help_command(update, context):
 4. 🤝 Согласуйте встречу
 
 *Контакты поддержки:*
-📞 @mizirf
+📞 @MaksutaMarce
 ⏰ 10:00 - 20:00 (МСК)
     """
     await update.message.reply_text(help_text, parse_mode='Markdown',
                                     reply_markup=main_menu_keyboard(update.effective_user.id))
 
-async def menu_command(update, context):
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /menu"""
     await start(update, context)
 
-# ========== ОБРАБОТЧИК CALLBACK ==========
-async def handle_callback(update, context):
+
+# ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик callback-запросов"""
     query = update.callback_query
     await query.answer()
     data = query.data
     user_id = query.from_user.id
-    logger.info(f"Callback: {data} от {user_id}")
+    logger.info(f"Callback: {data} от пользователя {user_id}")
 
+    # Обработка основных действий
     if data == "main_menu":
-        await edit_message_smart(query, "🏠 *Главное меню:*", reply_markup=main_menu_keyboard(user_id), parse_mode='Markdown')
+        await edit_message_smart(query, "🏠 *Главное меню:*", reply_markup=main_menu_keyboard(user_id),
+                                 parse_mode='Markdown')
     elif data == "shop":
         await edit_message_smart(query, "🛍️ *Выберите категорию:*", reply_markup=shop_keyboard(), parse_mode='Markdown')
     elif data == "admin_panel":
         if user_id in ADMIN_IDS:
-            await edit_message_smart(query, "⚙️ *Админ-панель:*", reply_markup=admin_menu_keyboard(), parse_mode='Markdown')
+            await edit_message_smart(query, "⚙️ *Админ-панель:*", reply_markup=admin_menu_keyboard(),
+                                     parse_mode='Markdown')
         else:
             await query.answer("⛔ Доступ запрещен", show_alert=True)
     elif data.startswith("category_"):
@@ -665,7 +582,17 @@ async def handle_callback(update, context):
     elif data.startswith("pay_"):
         lot_id = data.split("_", 1)[1]
         context.user_data['awaiting_screenshot'] = lot_id
-        await edit_message_smart(query, "📸 *Отправьте скриншот оплаты:*", reply_markup=cancel_keyboard(), parse_mode='Markdown')
+        await edit_message_smart(
+            query,
+            "📸 *Отправьте скриншот оплаты:*\n\n"
+            "❗ *Важно:*\n"
+            "• Скриншот должен быть четким\n"
+            "• Должна быть видна сумма 500₽\n"
+            "• Должны быть видны реквизиты\n\n"
+            "⏳ *Подтверждение менеджером в течение 24 часов*",
+            reply_markup=cancel_keyboard(),
+            parse_mode='Markdown'
+        )
     elif data == "my_orders":
         await show_user_orders(update, context)
     elif data == "sell_device":
@@ -737,35 +664,83 @@ async def handle_callback(update, context):
     elif data == "cancel":
         await cancel_conversation(update, context)
     elif data == "noop":
-        pass
+        pass  # Ничего не делаем для кнопки-заглушки
     else:
-        await edit_message_smart(query, "❌ *Неизвестная команда*", reply_markup=main_menu_keyboard(user_id), parse_mode='Markdown')
+        # Если callback не распознан, показываем главное меню
+        await edit_message_smart(
+            query,
+            "❌ *Неизвестная команда*",
+            reply_markup=main_menu_keyboard(user_id),
+            parse_mode='Markdown'
+        )
 
-# ========== ФУНКЦИИ КАТЕГОРИЙ И ТОВАРОВ ==========
-async def show_category(update, context, category, page=0):
+
+async def show_category(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str, page: int = 0):
+    """Показать товары категории"""
     query = update.callback_query
+    user_id = query.from_user.id
+
+    # Получаем товары категории с пагинацией
     limit = 10
     offset = page * limit
-    items = db.fetchall('''SELECT * FROM lots WHERE category = ? AND status = 'available' ORDER BY created_at DESC LIMIT ? OFFSET ?''',
-                        (category, limit, offset))
-    total_items = db.fetchone("SELECT COUNT(*) as count FROM lots WHERE category = ? AND status = 'available'", (category,))['count']
-    total_pages = max((total_items + limit - 1) // limit, 1)
+    items = db.fetchall('''
+        SELECT * FROM lots
+        WHERE category = ? AND status = 'available'
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+    ''', (category, limit, offset))
+
+    total_items_result = db.fetchone('''
+        SELECT COUNT(*) as count FROM lots
+        WHERE category = ? AND status = 'available'
+    ''', (category,))
+    total_items = total_items_result['count'] if total_items_result else 0
+    total_pages = (total_items + limit - 1) // limit if total_items > 0 else 1
+
     if not items:
         category_name = CATEGORIES.get(category, category)
-        await edit_message_smart(query, f"📭 *В категории '{category_name}' пока нет товаров*", reply_markup=shop_keyboard(), parse_mode='Markdown')
+        await edit_message_smart(
+            query,
+            f"📭 *В категории '{category_name}' пока нет товаров*\n\n"
+            f"✨ *Скоро появятся новые устройства!*",
+            reply_markup=shop_keyboard(),
+            parse_mode='Markdown'
+        )
         return
+
+    # Формируем список товаров
     keyboard = []
     for item in items:
         emoji = CATEGORY_EMOJIS.get(item['category'], '📦')
-        keyboard.append([InlineKeyboardButton(f"{emoji} {item['name']} - {format_price(item['price'])}₽", callback_data=f"lot_{item['lot_id']}")])
-    keyboard.append(category_keyboard(category, page, total_pages).inline_keyboard[0])
-    keyboard.append([InlineKeyboardButton("🛍️ Все категории", callback_data="shop"), InlineKeyboardButton("🏠 В меню", callback_data="main_menu")])
-    category_name = CATEGORIES.get(category, category)
-    await edit_message_smart(query, f"🛍️ *{category_name}* (стр. {page+1}/{total_pages}):\n📊 Найдено товаров: {total_items}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{emoji} {item['name']} - {format_price(item['price'])}₽",
+                callback_data=f"lot_{item['lot_id']}"
+            )
+        ])
 
-async def show_lot(update, context, lot_id):
+    # Добавляем пагинацию
+    keyboard.append(category_keyboard(category, page, total_pages).inline_keyboard[0])
+    keyboard.append([
+        InlineKeyboardButton("🛍️ Все категории", callback_data="shop"),
+        InlineKeyboardButton("🏠 В меню", callback_data="main_menu")
+    ])
+
+    category_name = CATEGORIES.get(category, category)
+    await edit_message_smart(
+        query,
+        f"🛍️ *{category_name}* (страница {page + 1} из {total_pages}):\n\n"
+        f"📊 *Найдено товаров:* {total_items}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+async def show_lot(update: Update, context: ContextTypes.DEFAULT_TYPE, lot_id: str):
+    """Показать подробную информацию о товаре"""
     query = update.callback_query if update.callback_query else None
     user_id = update.effective_user.id
+
     lot = db.fetchone("SELECT * FROM lots WHERE lot_id = ?", (lot_id,))
     if not lot:
         text = "❌ *Товар не найден*"
@@ -774,12 +749,23 @@ async def show_lot(update, context, lot_id):
         else:
             await update.message.reply_text(text, parse_mode='Markdown', reply_markup=shop_keyboard())
         return
+
+    # Обновляем счетчик просмотров
     db.execute('UPDATE lots SET views = views + 1 WHERE lot_id = ?', (lot_id,))
-    db.execute('INSERT OR REPLACE INTO views (user_id, lot_id, viewed_at) VALUES (?, ?, CURRENT_TIMESTAMP)', (user_id, lot_id))
+    db.execute('''
+        INSERT OR REPLACE INTO views (user_id, lot_id, viewed_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+    ''', (user_id, lot_id))
+
+    # Формируем текст
     category_name = CATEGORIES.get(lot['category'], lot['category'])
     status_info = STATUSES.get(lot['status'], {'text': lot['status'], 'emoji': '📦'})
+    photos = lot['photos'].split(',') if lot['photos'] else []
     balance = lot['price'] - DEPOSIT_FIXED
-    text = f"""{status_info['emoji']} *{lot['name']}*
+
+    text = f"""
+{status_info['emoji']} *{lot['name']}*
+
 📋 *Характеристики:*
 • 📂 Категория: {category_name}
 • 💰 Цена: {format_price(lot['price'])}₽
@@ -791,7 +777,7 @@ async def show_lot(update, context, lot_id):
 {lot['description']}
 
 🔐 *Условия покупки:*
-• 💳 Предоплата: {DEPOSIT_FIXED}₽
+• 💳 Предоплата: {DEPOSIT_FIXED}₽ (фиксированная)
 • 💰 Остаток при получении: {format_price(balance)}₽
 • 🚚 Доставка: бесплатно по России
 • ⏰ Бронь на: 24 часов
@@ -801,26 +787,28 @@ async def show_lot(update, context, lot_id):
 
 {status_info['emoji']} *Статус:* {status_info['text']}
     """
+
     reply_markup = lot_keyboard(lot_id, lot['status'], user_id)
-    photos = lot['photos'].split(',') if lot['photos'] else []
+
     if photos:
         try:
             if query:
                 await query.message.delete()
-            with open(STATIC_DIR / photos[0].split('/')[-1], 'rb') as f:
-                message = await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=f,
-                    caption=text,
-                    parse_mode='Markdown',
-                    reply_markup=reply_markup
-                )
+
+            message = await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=photos[0],
+                caption=text,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+
             if len(photos) > 1:
-                media_group = []
-                for p in photos[1:]:
-                    with open(STATIC_DIR / p.split('/')[-1], 'rb') as fp:
-                        media_group.append(InputMediaPhoto(media=fp))
-                await context.bot.send_media_group(chat_id=update.effective_chat.id, media=media_group)
+                media_group = [InputMediaPhoto(media=photo) for photo in photos[1:]]
+                await context.bot.send_media_group(
+                    chat_id=update.effective_chat.id,
+                    media=media_group
+                )
         except Exception as e:
             logger.error(f"Ошибка отправки фото: {e}")
             if query:
@@ -833,193 +821,530 @@ async def show_lot(update, context, lot_id):
         else:
             await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
 
-async def start_payment(update, context, lot_id):
+
+async def start_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, lot_id: str):
+    """Начать процесс оплаты"""
     query = update.callback_query
     lot = db.fetchone("SELECT * FROM lots WHERE lot_id = ?", (lot_id,))
-    if not lot or lot['status'] != 'available':
-        await query.answer("❌ Товар недоступен", show_alert=True)
+    if not lot:
+        await query.answer("❌ Товар не найден", show_alert=True)
         return
+
+    if lot['status'] != 'available':
+        await query.answer("❌ Товар недоступен для бронирования", show_alert=True)
+        return
+
+    user = update.effective_user
     balance = lot['price'] - DEPOSIT_FIXED
-    payment_text = f"""💳 *ОФОРМЛЕНИЕ ЗАКАЗА*
+
+    payment_text = f"""
+💳 *ОФОРМЛЕНИЕ ЗАКАЗА*
+
 📱 *Товар:* {lot['name']}
 🆔 *Артикул:* `{lot['lot_id']}`
 💰 *Цена:* {format_price(lot['price'])}₽
+
 🔐 *Условия оплаты:*
 • 💵 Предоплата: {DEPOSIT_FIXED}₽
 • 💰 Остаток: {format_price(balance)}₽
 • 🚚 Доставка: бесплатно
-⚠️ *Важно:* ❌Имеется недостаток товара: невозможно установить и использовать RuStore
+• ⏰ Бронь на 24 часа
 
-🏦 *Реквизиты:* Сбербанк, карта: `2202 2068 3661 5885`, получатель: МАКСИМ М.
-"""
-    await edit_message_smart(query, payment_text, reply_markup=payment_keyboard(lot_id), parse_mode='Markdown')
+⚠️ *Важно:*
+❌Имеется недостаток товара: невозможно установить и использовать RuStore
 
-async def show_user_orders(update, context):
+🏦 *Реквизиты для оплаты:*
+• Банк: Сбербанк
+• Карта: `2202 2068 3661 5885`
+• Получатель: МАКСИМ М.
+
+📋 *Инструкция:*
+1. Переведите {DEPOSIT_FIXED}₽ на указанные реквизиты
+2. Сделайте четкий скриншот перевода
+3. Нажмите кнопку ниже и отправьте скриншот
+4. Ожидайте подтверждения менеджера
+
+⏳ *Подтверждение в течение 1 часа*
+    """
+
+    await edit_message_smart(
+        query,
+        payment_text,
+        reply_markup=payment_keyboard(lot_id),
+        parse_mode='Markdown'
+    )
+
+
+async def show_user_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать заказы пользователя"""
     query = update.callback_query
     user_id = update.effective_user.id
-    orders = db.fetchall('''SELECT o.*, l.name as product_name, l.price, l.lot_id
-                            FROM orders o JOIN lots l ON o.lot_id = l.lot_id
-                            WHERE o.user_id = ? ORDER BY o.created_at DESC''', (user_id,))
+
+    orders = db.fetchall('''
+        SELECT o.*, l.name as product_name, l.price, l.lot_id
+        FROM orders o
+        JOIN lots l ON o.lot_id = l.lot_id
+        WHERE o.user_id = ?
+        ORDER BY o.created_at DESC
+    ''', (user_id,))
+
     if not orders:
-        await edit_message_smart(query, "📭 *У вас пока нет заказов*", reply_markup=shop_keyboard(), parse_mode='Markdown')
+        await edit_message_smart(
+            query,
+            "📭 *У вас пока нет заказов*\n\n"
+            "🛍️ *Как сделать заказ:*\n"
+            "1. Выберите товар в магазине\n"
+            "2. Оплатите предоплату 500₽\n"
+            "3. Отправьте скриншот оплаты\n"
+            "4. Получите подтверждение менеджера",
+            reply_markup=shop_keyboard(),
+            parse_mode='Markdown'
+        )
         return
+
     text = "📦 *Ваши заказы:*\n\n"
     for order in orders:
         status_info = STATUSES.get(order['status'], {'text': order['status'], 'emoji': '📦'})
-        text += f"{status_info['emoji']} *Заказ #{order['id']}*\n📱 {order['product_name']}\n💰 {format_price(order['price'])}₽\n📅 {order['created_at'][:10]}\n📊 Статус: {status_info['text']}\n\n"
-    await edit_message_smart(query, text, reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛍️ В магазин", callback_data="shop")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
-    ]), parse_mode='Markdown')
+        text += f"{status_info['emoji']} *Заказ #{order['id']}*\n"
+        text += f"📱 {order['product_name']}\n"
+        text += f"💰 {format_price(order['price'])}₽\n"
+        text += f"📅 {order['created_at'][:10]}\n"
+        text += f"📊 Статус: {status_info['text']}\n\n"
 
-async def toggle_favorite(update, context, lot_id):
+    await edit_message_smart(
+        query,
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛍️ В магазин", callback_data="shop")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
+        ]),
+        parse_mode='Markdown'
+    )
+
+
+async def toggle_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE, lot_id: str):
+    """Добавить/удалить товар из избранного"""
     query = update.callback_query
     user_id = query.from_user.id
+
+    # Проверяем, есть ли уже в избранном
     fav = db.fetchone("SELECT * FROM favorites WHERE user_id = ? AND lot_id = ?", (user_id, lot_id))
     if fav:
+        # Удаляем из избранного
         db.execute("DELETE FROM favorites WHERE user_id = ? AND lot_id = ?", (user_id, lot_id))
         await query.answer("❌ Удалено из избранного", show_alert=True)
     else:
+        # Добавляем в избранное
         db.execute("INSERT INTO favorites (user_id, lot_id) VALUES (?, ?)", (user_id, lot_id))
         await query.answer("⭐ Добавлено в избранное", show_alert=True)
+
+    # Обновляем сообщение с товаром
     await show_lot(update, context, lot_id)
 
-async def show_favorites(update, context):
+
+async def show_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать избранные товары"""
     query = update.callback_query
     user_id = query.from_user.id
-    favorites = db.fetchall('''SELECT l.* FROM lots l
-                               JOIN favorites f ON l.lot_id = f.lot_id
-                               WHERE f.user_id = ? AND l.status = 'available'
-                               ORDER BY f.added_at DESC''', (user_id,))
+
+    favorites = db.fetchall('''
+        SELECT l.* FROM lots l
+        JOIN favorites f ON l.lot_id = f.lot_id
+        WHERE f.user_id = ? AND l.status = 'available'
+        ORDER BY f.added_at DESC
+    ''', (user_id,))
+
     if not favorites:
-        await edit_message_smart(query, "⭐ *Избранное пусто*", reply_markup=shop_keyboard(), parse_mode='Markdown')
+        await edit_message_smart(
+            query,
+            "⭐ *У вас пока нет избранных товаров*\n\n"
+            "✨ *Как добавить в избранное:*\n"
+            "1. Откройте товар в магазине\n"
+            "2. Нажмите кнопку ⭐\n"
+            "3. Товар появится здесь\n\n"
+            "⭐ *Быстрый доступ к любимым товарам!*",
+            reply_markup=shop_keyboard(),
+            parse_mode='Markdown'
+        )
         return
+
     text = "⭐ *Избранные товары:*\n\n"
     for item in favorites:
         emoji = CATEGORY_EMOJIS.get(item['category'], '📦')
-        text += f"{emoji} *{item['name']}*\n💰 {format_price(item['price'])}₽\n📂 {CATEGORIES.get(item['category'], item['category'])}\n🆔 `{item['lot_id']}`\n────────\n"
-    await edit_message_smart(query, text, reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛍️ В магазин", callback_data="shop")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
-    ]), parse_mode='Markdown')
+        text += f"{emoji} *{item['name']}*\n"
+        text += f"💰 {format_price(item['price'])}₽\n"
+        text += f"📂 {CATEGORIES.get(item['category'], item['category'])}\n"
+        text += f"🆔 `{item['lot_id']}`\n"
+        text += "────────────────────\n\n"
 
-async def start_search(update, context):
+    await edit_message_smart(
+        query,
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛍️ В магазин", callback_data="shop")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
+        ]),
+        parse_mode='Markdown'
+    )
+
+
+# ========== ПОИСК ТОВАРОВ ==========
+async def start_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать поиск товаров"""
     query = update.callback_query
-    await edit_message_smart(query, "🔍 *Поиск товаров*\nВведите название или ключевые слова:", reply_markup=search_keyboard(), parse_mode='Markdown')
+    await edit_message_smart(
+        query,
+        "🔍 *ПОИСК ТОВАРОВ*\n\n"
+        "Введите название или ключевые слова для поиска:\n\n"
+        "✨ *Примеры:*\n"
+        "• iPhone 14\n"
+        "• MacBook Air\n"
+        "• Apple Watch\n"
+        "• 256GB\n"
+        "• Pro Max",
+        reply_markup=search_keyboard(),
+        parse_mode='Markdown'
+    )
     return SEARCH
 
-async def handle_search(update, context):
+
+async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка поискового запроса"""
     search_query = update.message.text.strip()
-    if len(search_query) < 2:
-        await update.message.reply_text("❌ *Слишком короткий запрос*", parse_mode='Markdown', reply_markup=search_keyboard())
+    if not search_query or len(search_query) < 2:
+        await update.message.reply_text(
+            "❌ *Слишком короткий запрос*\n\n"
+            "Введите минимум 2 символа для поиска.",
+            parse_mode='Markdown',
+            reply_markup=search_keyboard()
+        )
         return SEARCH
-    items = db.fetchall('''SELECT * FROM lots WHERE (name LIKE ? OR description LIKE ?) AND status = 'available' ORDER BY created_at DESC LIMIT 20''',
-                        (f'%{search_query}%', f'%{search_query}%'))
+
+    # Выполняем поиск в базе данных
+    items = db.fetchall('''
+        SELECT * FROM lots 
+        WHERE (name LIKE ? OR description LIKE ?) 
+        AND status = 'available'
+        ORDER BY created_at DESC
+        LIMIT 20
+    ''', (f'%{search_query}%', f'%{search_query}%'))
+
     if not items:
-        await update.message.reply_text(f"🔍 *По запросу \"{search_query}\" ничего не найдено*", parse_mode='Markdown',
-                                        reply_markup=InlineKeyboardMarkup([
-                                            [InlineKeyboardButton("🛍️ В магазин", callback_data="shop")],
-                                            [InlineKeyboardButton("🔍 Новый поиск", callback_data="search")],
-                                            [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
-                                        ]))
+        await update.message.reply_text(
+            f"🔍 *По запросу \"{search_query}\" ничего не найдено*\n\n"
+            "Попробуйте изменить запрос или посмотрите все товары в магазине.",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛍️ В магазин", callback_data="shop")],
+                [InlineKeyboardButton("🔍 Новый поиск", callback_data="search")],
+                [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
+            ])
+        )
         return ConversationHandler.END
-    text = f"🔍 *Результаты поиска \"{search_query}\":*\n\n"
+
+    # Формируем список найденных товаров
+    text = f"🔍 *Результаты поиска по запросу \"{search_query}\":*\n\n"
     keyboard = []
+
     for item in items:
         emoji = CATEGORY_EMOJIS.get(item['category'], '📦')
-        keyboard.append([InlineKeyboardButton(f"{emoji} {item['name']} - {format_price(item['price'])}₽", callback_data=f"lot_{item['lot_id']}")])
-    keyboard.append([InlineKeyboardButton("🛍️ В магазин", callback_data="shop"), InlineKeyboardButton("🔍 Новый поиск", callback_data="search")])
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{emoji} {item['name']} - {format_price(item['price'])}₽",
+                callback_data=f"lot_{item['lot_id']}"
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("🛍️ В магазин", callback_data="shop"),
+        InlineKeyboardButton("🔍 Новый поиск", callback_data="search")
+    ])
     keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="main_menu")])
-    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+
+    await update.message.reply_text(
+        text,
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
     return ConversationHandler.END
 
+
 # ========== ПРОДАЖА УСТРОЙСТВА ==========
-async def start_buyback_conversation(update, context):
+async def start_buyback_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать диалог по продаже устройства"""
     query = update.callback_query
     context.user_data['buyback'] = {}
     context.user_data['buyback_photos'] = []
-    await edit_message_smart(query, "💰 *ПРОДАЖА УСТРОЙСТВА APPLE*\n\n*Введите модель:*", reply_markup=cancel_keyboard(), parse_mode='Markdown')
+
+    await edit_message_smart(
+        query,
+        "💰 *ПРОДАЖА УСТРОЙСТВА APPLE*\n\n"
+        "✨ *Мы предлагаем:*\n"
+        "• 💎 Максимальную цену на рынке\n"
+        "• ⚡ Мгновенную оплату\n"
+        "• 🚗 Бесплатный выезд\n"
+        "• 🔒 Безопасную сделку\n\n"
+        "📱 *Шаг 1 из 6*\n"
+        "*Введите модель вашего устройства:*\n\n"
+        "✨ *Примеры:*\n"
+        "• iPhone 14 Pro Max 256GB\n"
+        "• MacBook Air M2 2022\n"
+        "• Apple Watch Series 9",
+        reply_markup=cancel_keyboard(),
+        parse_mode='Markdown'
+    )
     return DEVICE_MODEL
 
-async def handle_device_model(update, context):
+
+async def handle_device_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка модели устройства"""
     context.user_data['buyback']['model'] = update.message.text
-    await update.message.reply_text("*Опишите состояние:*", parse_mode='Markdown', reply_markup=cancel_keyboard())
+    await update.message.reply_text(
+        "📊 *Шаг 2 из 6*\n"
+        "*Опишите состояние устройства:*\n\n"
+        "✨ *Примеры:*\n"
+        "• Новое (в коробке, не использовалось)\n"
+        "• Отличное (минимальные следы использования)\n"
+        "• Хорошее (есть небольшие потертости)\n"
+        "• Удовлетворительное (есть повреждения)\n"
+        "• Требует ремонта",
+        parse_mode='Markdown',
+        reply_markup=cancel_keyboard()
+    )
     return DEVICE_CONDITION
 
-async def handle_device_condition(update, context):
+
+async def handle_device_condition(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка состояния устройства"""
     context.user_data['buyback']['condition'] = update.message.text
-    await update.message.reply_text("*Дополнительные детали:*", parse_mode='Markdown', reply_markup=cancel_keyboard())
+    await update.message.reply_text(
+        "📝 *Шаг 3 из 6*\n"
+        "*Дополнительные детали:*\n\n"
+        "✨ *Что можно указать:*\n"
+        "• Комплектация (наличие коробки, зарядки)\n"
+        "• Срок использования\n"
+        "• Проводился ли ремонт\n"
+        "• Косметические дефекты\n"
+        "• Особенности работы",
+        parse_mode='Markdown',
+        reply_markup=cancel_keyboard()
+    )
     return DEVICE_DESCRIPTION
 
-async def handle_device_description(update, context):
+
+async def handle_device_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка описания устройства"""
     context.user_data['buyback']['description'] = update.message.text
-    await update.message.reply_text("*Ваше местоположение:*", parse_mode='Markdown', reply_markup=cancel_keyboard())
+    await update.message.reply_text(
+        "📍 *Шаг 4 из 6*\n"
+        "*Ваше местоположение:*\n\n"
+        "✨ *Пример:*\n"
+        "• Москва, м. Пушкинская\n"
+        "• Санкт-Петербург, центр\n"
+        "• Казань, Вахитовский район\n\n"
+        "🚗 *Мы приезжаем к вам бесплатно!*",
+        parse_mode='Markdown',
+        reply_markup=cancel_keyboard()
+    )
     return DEVICE_LOCATION
 
-async def handle_device_location(update, context):
+
+async def handle_device_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка местоположения"""
     context.user_data['buyback']['location'] = update.message.text
-    await update.message.reply_text("*Контактные данные:*", parse_mode='Markdown', reply_markup=cancel_keyboard())
+    await update.message.reply_text(
+        "📞 *Шаг 5 из 6*\n"
+        "*Контактные данные:*\n\n"
+        "✨ *Пример:*\n"
+        "• Телефон: +7 676 767-67-67\n"
+        "• Telegram: @epstein \n\n"
+        "❗ *На эти данные мы свяжемся с вами*",
+        parse_mode='Markdown',
+        reply_markup=cancel_keyboard()
+    )
     return DEVICE_CONTACT
 
-async def handle_device_contact(update, context):
+
+async def handle_device_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка контактов"""
     context.user_data['buyback']['contact'] = update.message.text
-    await update.message.reply_text("📸 *Отправьте фото устройства (или пропустите):*", parse_mode='Markdown',
-                                    reply_markup=InlineKeyboardMarkup([
-                                        [InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_photos")],
-                                        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]
-                                    ]))
+    await update.message.reply_text(
+        "📸 *Шаг 6 из 6 (опционально)*\n"
+        "*Отправьте фото устройства:*\n\n"
+        "✨ *Можно отправить несколько фото:*\n"
+        "• Общий вид\n"
+        "• Экрана/дисплея\n"
+        "• Углов и граней\n"
+        "• Дефекты (если есть)\n\n"
+        "📎 *Отправьте фото или нажмите «Пропустить»*",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_photos")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]
+        ])
+    )
     return DEVICE_PHOTOS
 
-async def handle_device_photos(update, context):
+
+async def handle_device_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фото устройства"""
     if 'buyback_photos' not in context.user_data:
         context.user_data['buyback_photos'] = []
+
     if update.message.photo:
         photo = update.message.photo[-1]
         if len(context.user_data['buyback_photos']) >= MAX_PHOTOS:
-            await update.message.reply_text(f"❌ Максимум {MAX_PHOTOS} фото", reply_markup=photos_keyboard())
+            await update.message.reply_text(
+                f"❌ *Достигнут максимум {MAX_PHOTOS} фото*\n\n"
+                f"✅ *Нажмите «Готово» чтобы завершить*",
+                parse_mode='Markdown',
+                reply_markup=photos_keyboard()
+            )
             return DEVICE_PHOTOS
-        local_path = await download_photo(photo.file_id, context)
-        context.user_data['buyback_photos'].append(local_path)
+
+        context.user_data['buyback_photos'].append(photo.file_id)
         count = len(context.user_data['buyback_photos'])
-        await update.message.reply_text(f"✅ Фото добавлено! ({count}/{MAX_PHOTOS})", reply_markup=photos_keyboard())
+
+        await update.message.reply_text(
+            f"✅ *Фото добавлено!* ({count}/{MAX_PHOTOS})\n\n"
+            f"📸 *Отправьте еще фото или нажмите «Готово»*",
+            parse_mode='Markdown',
+            reply_markup=photos_keyboard()
+        )
     return DEVICE_PHOTOS
 
-async def finish_buyback(update, context, with_photos=True):
+
+async def finish_buyback_with_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await finish_buyback(update, context, with_photos=True)
+
+
+async def finish_buyback_without_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await finish_buyback(update, context, with_photos=False)
+
+
+async def finish_buyback(update: Update, context: ContextTypes.DEFAULT_TYPE, with_photos: bool = True):
     query = update.callback_query
     user = update.effective_user
     buyback_data = context.user_data.get('buyback', {})
-    if not all(k in buyback_data for k in ('model', 'condition', 'contact')):
-        await edit_message_smart(query, "❌ *Ошибка: обязательные поля не заполнены*", reply_markup=main_menu_keyboard(user.id), parse_mode='Markdown')
+
+    if not buyback_data:
+        await edit_message_smart(
+            query,
+            "❌ *Ошибка создания заявки*",
+            reply_markup=main_menu_keyboard(user.id),
+            parse_mode='Markdown'
+        )
         return ConversationHandler.END
+
+    required_fields = ['model', 'condition', 'contact']
+    for field in required_fields:
+        if field not in buyback_data or not buyback_data[field]:
+            await edit_message_smart(
+                query,
+                f"❌ *Ошибка: поле '{field}' обязательно для заполнения*",
+                reply_markup=main_menu_keyboard(user.id),
+                parse_mode='Markdown'
+            )
+            return ConversationHandler.END
+
     photos = ','.join(context.user_data.get('buyback_photos', [])) if with_photos else ''
-    cursor = db.execute('''INSERT INTO buyback_requests
-                           (user_id, user_name, user_username, device_model, device_condition,
-                            description, photos, location, contact_info, status)
-                           VALUES (?,?,?,?,?,?,?,?,?,?)''',
-                        (user.id, user.full_name, user.username, buyback_data['model'],
-                         buyback_data['condition'], buyback_data.get('description', ''),
-                         photos, buyback_data.get('location', ''), buyback_data['contact'], 'pending'))
-    request_id = cursor.lastrowid
-    for admin_id in ADMIN_IDS:
-        try:
-            text = f"💰 *НОВАЯ ЗАЯВКА НА ВЫКУП #{request_id}*\n👤 {user.full_name}\n📱 {buyback_data['model']}\n📞 {buyback_data['contact']}"
-            await context.bot.send_message(admin_id, text, parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Ошибка отправки админу {admin_id}: {e}")
-    await edit_message_smart(query, "✅ *Заявка отправлена!*", reply_markup=main_menu_keyboard(user.id), parse_mode='Markdown')
-    for key in list(context.user_data.keys()):
-        if key.startswith('buyback'):
+
+    try:
+        cursor = db.execute('''
+            INSERT INTO buyback_requests
+            (user_id, user_name, user_username, device_model, device_condition,
+             description, photos, location, contact_info, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        ''', (
+            user.id,
+            user.full_name,
+            user.username,
+            buyback_data['model'],
+            buyback_data['condition'],
+            buyback_data.get('description', ''),
+            photos,
+            buyback_data.get('location', ''),
+            buyback_data['contact']
+        ))
+        request_id = cursor.lastrowid
+
+        for admin_id in ADMIN_IDS:
+            try:
+                text = f"""
+💰 *НОВАЯ ЗАЯВКА НА ВЫКУП #{request_id}!*
+👤 *Пользователь:* {user.full_name}
+🆔 *ID:* {user.id}
+📱 *Модель:* {buyback_data['model']}
+📊 *Состояние:* {buyback_data['condition']}
+📍 *Локация:* {buyback_data.get('location', 'Не указано')}
+📞 *Контакты:* {buyback_data['contact']}
+📅 *Время:* {datetime.now().strftime('%d.%m.%Y %H:%M')}
+                """
+                if photos:
+                    photo_list = photos.split(',')
+                    if photo_list:
+                        try:
+                            await context.bot.send_photo(
+                                chat_id=admin_id,
+                                photo=photo_list[0],
+                                caption=text,
+                                parse_mode='Markdown'
+                            )
+                        except:
+                            await context.bot.send_message(
+                                chat_id=admin_id,
+                                text=text,
+                                parse_mode='Markdown'
+                            )
+                    else:
+                        await context.bot.send_message(
+                            chat_id=admin_id,
+                            text=text,
+                            parse_mode='Markdown'
+                        )
+                else:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=text,
+                        parse_mode='Markdown'
+                    )
+            except Exception as e:
+                logger.error(f"Ошибка отправки админу {admin_id}: {e}")
+
+        keys_to_delete = [key for key in context.user_data if key.startswith('buyback')]
+        for key in keys_to_delete:
             del context.user_data[key]
+
+        await edit_message_smart(
+            query,
+            "✅ *Заявка успешно отправлена!*\n\n"
+            "✨ *Что дальше:*\n"
+            "• ⏳ Мы свяжемся в течение 1 часа\n"
+            "• 💎 Получите максимальную оценку\n"
+            "• 🤝 Согласуем удобное время\n"
+            "• 💰 Мгновенная оплата наличными\n\n"
+            "📞 *Контакты:* @mizirf ",
+            reply_markup=main_menu_keyboard(user.id),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Ошибка сохранения заявки: {e}")
+        await edit_message_smart(
+            query,
+            "❌ *Ошибка при сохранении заявки. Попробуйте позже.*",
+            reply_markup=main_menu_keyboard(user.id),
+            parse_mode='Markdown'
+        )
     return ConversationHandler.END
 
-async def finish_buyback_without_photos(update, context):
-    return await finish_buyback(update, context, with_photos=False)
 
-# ========== АДМИН-ФУНКЦИИ ==========
-async def start_add_lot_conversation(update, context):
+# ========== АДМИН ФУНКЦИИ ==========
+async def start_add_lot_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать добавление товара"""
     query = update.callback_query
     context.user_data['adding_lot'] = {}
     context.user_data['lot_photos'] = []
+
     keyboard = []
     categories = list(CATEGORIES.items())
     for i in range(0, len(categories), 2):
@@ -1031,75 +1356,179 @@ async def start_add_lot_conversation(update, context):
             cat_id, cat_name = categories[i + 1]
             row.append(InlineKeyboardButton(cat_name, callback_data=f"add_cat_{cat_id}"))
         keyboard.append(row)
+
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
-    await edit_message_smart(query, "➕ *ДОБАВЛЕНИЕ ТОВАРА*\n📂 *Выберите категорию:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    await edit_message_smart(
+        query,
+        "➕ *ДОБАВЛЕНИЕ ТОВАРА*\n\n"
+        "📂 *Шаг 1 из 5*\n"
+        "*Выберите категорию:*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
     return LOT_CATEGORY
 
-async def handle_lot_category(update, context):
+
+async def handle_lot_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора категории"""
     query = update.callback_query
     category = query.data.split("_")[2]
     context.user_data['adding_lot']['category'] = category
-    await edit_message_smart(query, "📝 *Введите название товара:*", reply_markup=cancel_keyboard(), parse_mode='Markdown')
+
+    await edit_message_smart(
+        query,
+        "📝 *Шаг 2 из 5*\n"
+        "*Введите название товара:*\n\n"
+        "✨ *Пример:* iPhone 14 Pro Max 256GB Space Black",
+        reply_markup=cancel_keyboard(),
+        parse_mode='Markdown'
+    )
     return LOT_NAME
 
-async def handle_lot_name(update, context):
+
+async def handle_lot_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка названия товара"""
     context.user_data['adding_lot']['name'] = update.message.text
-    await update.message.reply_text("💰 *Введите цену в рублях:*", reply_markup=cancel_keyboard(), parse_mode='Markdown')
+    await update.message.reply_text(
+        "💰 *Шаг 3 из 5*\n"
+        "*Введите цену товара в рублях:*\n\n"
+        "✨ *Пример:* 89990",
+        parse_mode='Markdown',
+        reply_markup=cancel_keyboard()
+    )
     return LOT_PRICE
 
-async def handle_lot_price(update, context):
+
+async def handle_lot_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка цены товара"""
     price_str = update.message.text
     valid, price = validate_price(price_str)
+
     if not valid:
-        await update.message.reply_text("❌ *Неверная цена. Минимум 100₽*", reply_markup=cancel_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text(
+            "❌ *Неверный формат цены*\n\n"
+            "💰 *Введите цену цифрами:*\n"
+            "• Пример: 89990\n"
+            "• Минимум: 100 рублей",
+            parse_mode='Markdown',
+            reply_markup=cancel_keyboard()
+        )
         return LOT_PRICE
+
     context.user_data['adding_lot']['price'] = price
-    await update.message.reply_text("📝 *Введите описание:*", reply_markup=cancel_keyboard(), parse_mode='Markdown')
+    await update.message.reply_text(
+        "📝 *Шаг 4 из 5*\n"
+        "*Введите описание товара:*\n\n"
+        "✨ *Что можно указать:*\n"
+        "• Технические характеристики\n"
+        "• Состояние и комплектацию\n"
+        "• Особенности и преимущества\n"
+        "• Гарантию и условия",
+        parse_mode='Markdown',
+        reply_markup=cancel_keyboard()
+    )
     return LOT_DESCRIPTION
 
-async def handle_lot_description(update, context):
+
+async def handle_lot_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка описания товара"""
     context.user_data['adding_lot']['description'] = update.message.text
-    await update.message.reply_text("📸 *Отправьте фото (до 10 шт.):*", reply_markup=photos_keyboard(), parse_mode='Markdown')
+    await update.message.reply_text(
+        "📸 *Шаг 5 из 5*\n"
+        "*Отправьте фото товара:*\n\n"
+        "✨ *Можно отправить до 10 фото:*\n"
+        "• Общий вид\n"
+        "• Детали\n"
+        "• Упаковку\n"
+        "• Документы\n\n"
+        "📎 *Отправьте первое фото:*",
+        parse_mode='Markdown',
+        reply_markup=photos_keyboard()
+    )
     return LOT_PHOTOS
 
-async def handle_lot_photos(update, context):
+
+async def handle_lot_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фото товара"""
     if 'lot_photos' not in context.user_data:
         context.user_data['lot_photos'] = []
+
     if update.message.photo:
         photo = update.message.photo[-1]
         if len(context.user_data['lot_photos']) >= MAX_PHOTOS:
-            await update.message.reply_text(f"❌ Максимум {MAX_PHOTOS} фото", reply_markup=photos_keyboard())
+            await update.message.reply_text(
+                f"📸 *Максимум {MAX_PHOTOS} фото достигнут*\n\n"
+                f"✅ *Нажмите «Готово» чтобы завершить*",
+                parse_mode='Markdown',
+                reply_markup=photos_keyboard()
+            )
             return LOT_PHOTOS
-        # Сохраняем file_id временно, потом скачаем
+
         context.user_data['lot_photos'].append(photo.file_id)
         count = len(context.user_data['lot_photos'])
-        await update.message.reply_text(f"✅ Фото добавлено! ({count}/{MAX_PHOTOS})", reply_markup=photos_keyboard())
+
+        if count >= MAX_PHOTOS:
+            await update.message.reply_text(
+                f"📸 *Максимум {MAX_PHOTOS} фото достигнут*\n\n"
+                f"✅ *Нажмите «Готово» чтобы завершить*",
+                parse_mode='Markdown',
+                reply_markup=photos_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ *Фото добавлено!* ({count}/{MAX_PHOTOS})\n\n"
+                f"📸 *Отправьте еще фото или нажмите «Готово»*",
+                parse_mode='Markdown',
+                reply_markup=photos_keyboard()
+            )
     return LOT_PHOTOS
 
-async def finish_add_lot(update, context):
+
+async def finish_add_lot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Завершение добавления товара"""
     query = update.callback_query
     lot_data = context.user_data.get('adding_lot', {})
-    photo_file_ids = context.user_data.get('lot_photos', [])
-    if not lot_data or not photo_file_ids:
-        await edit_message_smart(query, "❌ *Не все данные*", reply_markup=admin_menu_keyboard(), parse_mode='Markdown')
+    photos = context.user_data.get('lot_photos', [])
+
+    if not lot_data or not photos:
+        await edit_message_smart(
+            query,
+            "❌ *Ошибка: не все данные заполнены*",
+            reply_markup=admin_menu_keyboard(),
+            parse_mode='Markdown'
+        )
+        for key in ['adding_lot', 'lot_photos']:
+            if key in context.user_data:
+                del context.user_data[key]
         return ConversationHandler.END
-    # Скачиваем фото и сохраняем локальные пути
-    photo_paths = []
-    for file_id in photo_file_ids:
-        path = await download_photo(file_id, context)
-        photo_paths.append(path)
-    photos_str = ','.join(photo_paths)
-    lot_id = generate_lot_id()
-    db.execute('''INSERT INTO lots (lot_id, name, description, price, photos, category, status)
-                  VALUES (?,?,?,?,?,?,?)''',
-               (lot_id, lot_data['name'], lot_data['description'], lot_data['price'], photos_str, lot_data['category'], 'available'))
-    # Публикация в канал
+
+    # Сохраняем товар в БД
     try:
-        balance = lot_data['price'] - DEPOSIT_FIXED
-        caption = f"""🌟 *НОВЫЙ ТОВАР!* 🌟
+        lot_id = generate_lot_id()
+        photos_str = ','.join(photos)
+        category_name = CATEGORIES.get(lot_data['category'], lot_data['category'])
+
+        cursor = db.execute('''
+            INSERT INTO lots (lot_id, name, description, price, photos, category, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'available')
+        ''', (
+            lot_id,
+            lot_data['name'],
+            lot_data['description'],
+            lot_data['price'],
+            photos_str,
+            lot_data['category']
+        ))
+
+        # Публикуем в канал
+        try:
+            balance = lot_data['price'] - DEPOSIT_FIXED
+            caption = f"""
+🌟 *НОВЫЙ ТОВАР!* 🌟
 
 📱 *{lot_data['name']}*
-📂 Категория: {CATEGORIES.get(lot_data['category'], lot_data['category'])}
+📂 Категория: {category_name}
 💰 Цена: {format_price(lot_data['price'])}₽
 🆔 Артикул: `{lot_id}`
 
@@ -1116,55 +1545,110 @@ async def finish_add_lot(update, context):
 
 {get_channel_tag('available')}
 💬 @mizirf
-        """
-        with open(STATIC_DIR / photo_paths[0].split('/')[-1], 'rb') as f:
+            """
+            bot_link = f"https://t.me/{BOT_USERNAME}?start={lot_id}"
             message = await context.bot.send_photo(
                 chat_id=CHANNEL_ID,
-                photo=f,
+                photo=photos[0],
                 caption=caption,
                 parse_mode='Markdown',
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🛒 КУПИТЬ", url=f"https://t.me/{BOT_USERNAME}?start={lot_id}")
+                    InlineKeyboardButton("🛒 КУПИТЬ", url=bot_link)
                 ]])
             )
-        db.execute("UPDATE lots SET channel_message_id = ? WHERE lot_id = ?", (message.message_id, lot_id))
+            # Сохраняем ID сообщения в канале
+            db.execute("UPDATE lots SET channel_message_id = ? WHERE lot_id = ?", (message.message_id, lot_id))
+        except Exception as e:
+            logger.error(f"Ошибка публикации в канале: {e}")
+
+        # Очищаем данные
+        for key in ['adding_lot', 'lot_photos']:
+            if key in context.user_data:
+                del context.user_data[key]
+
+        await edit_message_smart(
+            query,
+            f"✅ *Товар успешно добавлен!*\n\n"
+            f"📱 *Название:* {lot_data['name']}\n"
+            f"📂 *Категория:* {category_name}\n"
+            f"💰 *Цена:* {format_price(lot_data['price'])}₽\n"
+            f"🆔 *Артикул:* `{lot_id}`\n"
+            f"📸 *Фото:* {len(photos)} шт.\n\n"
+            f"✨ *Товар опубликован в канале*",
+            reply_markup=admin_menu_keyboard(),
+            parse_mode='Markdown'
+        )
     except Exception as e:
-        logger.error(f"Ошибка публикации в канале: {e}")
-    await edit_message_smart(query, f"✅ *Товар {lot_id} добавлен!*", reply_markup=admin_menu_keyboard(), parse_mode='Markdown')
-    for key in ['adding_lot', 'lot_photos']:
-        if key in context.user_data: del context.user_data[key]
+        logger.error(f"Ошибка добавления товара: {e}")
+        await edit_message_smart(
+            query,
+            "❌ *Ошибка при добавлении товара. Попробуйте позже.*",
+            reply_markup=admin_menu_keyboard(),
+            parse_mode='Markdown'
+        )
     return ConversationHandler.END
 
-async def manage_lots(update, context):
+
+async def manage_lots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Управление товарами"""
     query = update.callback_query
-    lots = db.fetchall("SELECT * FROM lots ORDER BY created_at DESC LIMIT 20")
+    lots = db.fetchall('''
+        SELECT * FROM lots
+        ORDER BY created_at DESC
+        LIMIT 20
+    ''')
+
     if not lots:
-        await edit_message_smart(query, "📭 *Товаров нет*", reply_markup=admin_menu_keyboard(), parse_mode='Markdown')
+        await edit_message_smart(
+            query,
+            "📭 *Товаров пока нет*",
+            reply_markup=admin_menu_keyboard(),
+            parse_mode='Markdown'
+        )
         return
+
     keyboard = []
     for lot in lots:
         status_info = STATUSES.get(lot['status'], {'text': lot['status'], 'emoji': '📦'})
-        keyboard.append([InlineKeyboardButton(f"{status_info['emoji']} {lot['name'][:30]} - {format_price(lot['price'])}₽", callback_data=f"admin_lot_{lot['lot_id']}")])
-    keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="admin_panel")])
-    await edit_message_smart(query, "📊 *Управление товарами:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{status_info['emoji']} {lot['name'][:30]} - {format_price(lot['price'])}₽",
+                callback_data=f"admin_lot_{lot['lot_id']}"
+            )
+        ])
 
-async def admin_show_lot(update, context, lot_id):
+    keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="admin_panel")])
+
+    await edit_message_smart(
+        query,
+        "📊 *Управление товарами:*\n\n"
+        "📈 *Последние 20 товаров*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+async def admin_show_lot(update: Update, context: ContextTypes.DEFAULT_TYPE, lot_id: str):
     query = update.callback_query
     lot = db.fetchone("SELECT * FROM lots WHERE lot_id = ?", (lot_id,))
     if not lot:
         await edit_message_smart(query, "❌ Товар не найден", reply_markup=admin_menu_keyboard(), parse_mode='Markdown')
         return
+
     status_info = STATUSES.get(lot['status'], {'text': lot['status'], 'emoji': '📦'})
     text = f"⚙️ *Управление товаром*\n\n{lot['name']}\n{status_info['emoji']} Статус: {status_info['text']}\n💰 Цена: {format_price(lot['price'])}₽\n🆔 {lot['lot_id']}"
+
     keyboard = [
         [InlineKeyboardButton("✅ Доступен", callback_data=f"set_status_{lot_id}_available")],
         [InlineKeyboardButton("🔄 Забронирован", callback_data=f"set_status_{lot_id}_reserved")],
         [InlineKeyboardButton("❌ Продан", callback_data=f"set_status_{lot_id}_sold")],
         [InlineKeyboardButton("← Назад", callback_data="manage_lots")]
     ]
+
     await edit_message_smart(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
-async def set_lot_status(update, context, lot_id, new_status):
+
+async def set_lot_status(update: Update, context: ContextTypes.DEFAULT_TYPE, lot_id: str, new_status: str):
     query = update.callback_query
     db.execute("UPDATE lots SET status = ? WHERE lot_id = ?", (new_status, lot_id))
     lot = db.fetchone("SELECT * FROM lots WHERE lot_id = ?", (lot_id,))
@@ -1172,171 +1656,368 @@ async def set_lot_status(update, context, lot_id, new_status):
     await query.answer(f"Статус изменен на {STATUSES.get(new_status, {'text': new_status})['text']}")
     await admin_show_lot(update, context, lot_id)
 
-async def view_orders(update, context):
+
+async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр заказов"""
     query = update.callback_query
-    orders = db.fetchall('''SELECT o.*, l.name as product_name, l.price, l.lot_id
-                            FROM orders o JOIN lots l ON o.lot_id = l.lot_id
-                            ORDER BY o.created_at DESC LIMIT 20''')
+    orders = db.fetchall('''
+        SELECT o.*, l.name as product_name, l.price, l.lot_id
+        FROM orders o
+        JOIN lots l ON o.lot_id = l.lot_id
+        ORDER BY o.created_at DESC
+        LIMIT 20
+    ''')
+
     if not orders:
-        await edit_message_smart(query, "📭 *Нет заказов*", reply_markup=admin_menu_keyboard(), parse_mode='Markdown')
+        await edit_message_smart(
+            query,
+            "📭 *Нет заказов*",
+            reply_markup=admin_menu_keyboard(),
+            parse_mode='Markdown'
+        )
         return
+
     text = "📋 *Заказы:*\n\n"
     keyboard = []
     for order in orders:
         status_info = STATUSES.get(order['status'], {'text': order['status'], 'emoji': '📦'})
-        text += f"{status_info['emoji']} *Заказ #{order['id']}*\n📱 {order['product_name']}\n👤 {order['user_name']}\n📅 {order['created_at'][:16]}\n\n"
-        keyboard.append([InlineKeyboardButton(f"#{order['id']} {status_info['text']}", callback_data=f"admin_order_{order['id']}")])
+        text += f"{status_info['emoji']} *Заказ #{order['id']}*\n"
+        text += f"📱 {order['product_name']}\n"
+        text += f"👤 {order['user_name']}\n"
+        text += f"📅 {order['created_at'][:16]}\n\n"
+        keyboard.append([
+            InlineKeyboardButton(f"#{order['id']} {status_info['text']}", callback_data=f"admin_order_{order['id']}")
+        ])
+
     keyboard.append([InlineKeyboardButton("🔄 Обновить", callback_data="view_orders")])
     keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="admin_panel")])
-    await edit_message_smart(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
-async def admin_show_order(update, context, order_id):
+    await edit_message_smart(
+        query,
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+async def admin_show_order(update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: int):
     query = update.callback_query
-    order = db.fetchone('''SELECT o.*, l.name as product_name, l.lot_id
-                            FROM orders o JOIN lots l ON o.lot_id = l.lot_id
-                            WHERE o.id = ?''', (order_id,))
+    order = db.fetchone('''
+        SELECT o.*, l.name as product_name, l.lot_id
+        FROM orders o
+        JOIN lots l ON o.lot_id = l.lot_id
+        WHERE o.id = ?
+    ''', (order_id,))
+
     if not order:
-        await edit_message_smart(query, "❌ Заказ не найден", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Назад", callback_data="view_orders")]]), parse_mode='Markdown')
+        await edit_message_smart(query, "❌ Заказ не найден", reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("← Назад", callback_data="view_orders")]]), parse_mode='Markdown')
         return
+
     status_info = STATUSES.get(order['status'], {'text': order['status'], 'emoji': '📦'})
-    text = f"📋 *Заказ #{order_id}*\n\n📱 Товар: {order['product_name']}\n🆔 Артикул: {order['lot_id']}\n💰 Цена: {format_price(order['price'])}₽\n👤 Пользователь: {order['user_name']} @{order['user_username'] or ''}\n🆔 ID: {order['user_id']}\n📅 Дата: {order['created_at']}\n📊 Статус: {status_info['text']}\n"
+    text = f"📋 *Заказ #{order_id}*\n\n"
+    text += f"📱 Товар: {order['product_name']}\n"
+    text += f"🆔 Артикул: {order['lot_id']}\n"
+    text += f"💰 Цена: {format_price(order['price'])}₽\n"
+    text += f"👤 Пользователь: {order['user_name']} @{order['user_username'] or ''}\n"
+    text += f"ID пользователя: {order['user_id']}\n"
+    text += f"📅 Дата: {order['created_at']}\n"
+    text += f"📊 Статус: {status_info['text']}\n"
+
     keyboard = []
     if order['status'] == 'pending':
-        keyboard.append([InlineKeyboardButton("✅ Подтвердить", callback_data=f"approve_order_{order_id}"),
-                         InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_order_{order_id}")])
+        keyboard.append([
+            InlineKeyboardButton("✅ Подтвердить", callback_data=f"approve_order_{order_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_order_{order_id}")
+        ])
+
     keyboard.append([InlineKeyboardButton("← Назад", callback_data="view_orders")])
     reply_markup = InlineKeyboardMarkup(keyboard)
+
     if order['screenshot']:
-        try:
-            await query.message.delete()
-            # скриншот может храниться как file_id, но мы используем локальный путь? упростим
-            with open(STATIC_DIR / order['screenshot'].split('/')[-1], 'rb') as f:
-                await context.bot.send_photo(chat_id=query.message.chat_id, photo=f, caption=text, parse_mode='Markdown', reply_markup=reply_markup)
-        except:
-            await edit_message_smart(query, text, reply_markup=reply_markup, parse_mode='Markdown')
+        await query.message.delete()
+        await context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=order['screenshot'],
+            caption=text,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
     else:
         await edit_message_smart(query, text, reply_markup=reply_markup, parse_mode='Markdown')
 
-async def admin_show_order_details(update, context, order_id):
+
+async def admin_show_order_details(update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: int):
+    """Показать детали заказа администратору"""
     query = update.callback_query
-    order = db.fetchone('''SELECT o.*, l.name as product_name, l.lot_id, l.price
-                            FROM orders o JOIN lots l ON o.lot_id = l.lot_id WHERE o.id = ?''', (order_id,))
+    order = db.fetchone('''
+        SELECT o.*, l.name as product_name, l.lot_id, l.price
+        FROM orders o
+        JOIN lots l ON o.lot_id = l.lot_id
+        WHERE o.id = ?
+    ''', (order_id,))
+
     if not order:
         await query.answer("❌ Заказ не найден", show_alert=True)
         return
+
     status_info = STATUSES.get(order['status'], {'text': order['status'], 'emoji': '📦'})
-    text = f"""📋 *Детали заказа #{order_id}*
+    text = f"""
+📋 *Детали заказа #{order_id}*
+
 📱 *Товар:* {order['product_name']}
 🆔 *Артикул:* {order['lot_id']}
 💰 *Цена:* {format_price(order['price'])}₽
 💵 *Предоплата:* {DEPOSIT_FIXED}₽
+
 👤 *Покупатель:*
 • Имя: {order['user_name']}
 • Username: @{order['user_username'] or 'не указан'}
 • ID: {order['user_id']}
+
 📅 *Дата создания:* {order['created_at'][:19]}
 📊 *Статус:* {status_info['text']}
     """
-    await edit_message_smart(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Назад", callback_data=f"admin_order_{order_id}")]]), parse_mode='Markdown')
 
-async def approve_order(update, context, order_id):
+    await edit_message_smart(
+        query,
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("← Назад", callback_data=f"admin_order_{order_id}")]
+        ]),
+        parse_mode='Markdown'
+    )
+
+
+async def approve_order(update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: int):
     query = update.callback_query
     order = db.fetchone("SELECT * FROM orders WHERE id = ?", (order_id,))
+
     if order and order['status'] == 'pending':
         db.execute("UPDATE orders SET status = 'approved' WHERE id = ?", (order_id,))
+        # Меняем статус товара на "забронирован" только после подтверждения менеджера
         db.execute("UPDATE lots SET status = 'reserved' WHERE lot_id = ?", (order['lot_id'],))
         lot = db.fetchone("SELECT * FROM lots WHERE lot_id = ?", (order['lot_id'],))
         await update_channel_caption(context, lot)
+
         try:
-            await context.bot.send_message(order['user_id'], f"✅ *Ваш заказ #{order_id} подтвержден!*\nСвяжитесь с @mizirf", parse_mode='Markdown')
+            await context.bot.send_message(
+                order['user_id'],
+                f"✅ *Ваш заказ #{order_id} подтвержден!*\n\n"
+                f"Товар забронирован для вас.\n"
+                f"Свяжитесь с @mizirf для деталей доставки и оплаты остатка.",
+                parse_mode='Markdown'
+            )
         except Exception as e:
-            logger.error(f"Ошибка уведомления: {e}")
+            logger.error(f"Ошибка уведомления пользователя: {e}")
+
     await query.answer("Заказ подтвержден")
     await view_orders(update, context)
 
-async def reject_order(update, context, order_id):
+
+async def reject_order(update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: int):
     query = update.callback_query
     order = db.fetchone("SELECT * FROM orders WHERE id = ?", (order_id,))
+
     if order and order['status'] == 'pending':
         db.execute("UPDATE orders SET status = 'rejected' WHERE id = ?", (order_id,))
+        # Не меняем статус товара - он остается доступным, так как бронь не подтверждена
+
         try:
-            await context.bot.send_message(order['user_id'], f"❌ *Ваш заказ #{order_id} отклонен.* Товар снова доступен.", parse_mode='Markdown')
+            await context.bot.send_message(
+                order['user_id'],
+                f"❌ *Ваш заказ #{order_id} отклонен.*\n\n"
+                f"Причина: возможно, неверный скриншот оплаты.\n"
+                f"Товар снова доступен для покупки.\n"
+                f"Если это ошибка, свяжитесь с @mizirf.",
+                parse_mode='Markdown'
+            )
         except Exception as e:
-            logger.error(f"Ошибка уведомления: {e}")
+            logger.error(f"Ошибка уведомления пользователя: {e}")
+
     await query.answer("Заказ отклонен")
     await view_orders(update, context)
 
-async def admin_approve_order(update, context, order_id):
-    query = update.callback_query
-    if query.from_user.id not in ADMIN_IDS:
-        await query.answer("⛔ Нет прав", show_alert=True)
-        return
-    order = db.fetchone("SELECT * FROM orders WHERE id = ?", (order_id,))
-    if not order or order['status'] != 'pending':
-        await query.answer("❌ Заказ уже обработан", show_alert=True)
-        return
-    db.execute("UPDATE orders SET status = 'approved' WHERE id = ?", (order_id,))
-    db.execute("UPDATE lots SET status = 'reserved' WHERE lot_id = ?", (order['lot_id'],))
-    lot = db.fetchone("SELECT * FROM lots WHERE lot_id = ?", (order['lot_id'],))
-    await update_channel_caption(context, lot)
-    try:
-        await context.bot.send_message(order['user_id'], f"✅ *Ваш заказ #{order_id} подтвержден!*", parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Ошибка уведомления: {e}")
-    await query.edit_message_caption(caption=query.message.caption + "\n\n✅ *Бронь подтверждена*", parse_mode='Markdown', reply_markup=None)
-    await query.answer("✅ Подтверждено")
 
-async def admin_reject_order(update, context, order_id):
+async def admin_approve_order(update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: int):
+    """Подтвердить бронь через кнопку в уведомлении"""
     query = update.callback_query
-    if query.from_user.id not in ADMIN_IDS:
-        await query.answer("⛔ Нет прав", show_alert=True)
-        return
-    order = db.fetchone("SELECT * FROM orders WHERE id = ?", (order_id,))
-    if not order or order['status'] != 'pending':
-        await query.answer("❌ Заказ уже обработан", show_alert=True)
-        return
-    db.execute("UPDATE orders SET status = 'rejected' WHERE id = ?", (order_id,))
-    try:
-        await context.bot.send_message(order['user_id'], f"❌ *Ваш заказ #{order_id} отклонен.*", parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Ошибка уведомления: {e}")
-    await query.edit_message_caption(caption=query.message.caption + "\n\n❌ *Бронь отклонена*", parse_mode='Markdown', reply_markup=None)
-    await query.answer("❌ Отклонено")
+    user_id = query.from_user.id
 
-async def admin_contact_order(update, context, order_id):
-    query = update.callback_query
-    if query.from_user.id not in ADMIN_IDS:
-        await query.answer("⛔ Нет прав", show_alert=True)
+    if user_id not in ADMIN_IDS:
+        await query.answer("⛔ У вас нет прав для этого действия", show_alert=True)
         return
+
     order = db.fetchone("SELECT * FROM orders WHERE id = ?", (order_id,))
+
     if not order:
         await query.answer("❌ Заказ не найден", show_alert=True)
         return
-    contact_info = f"""📞 *Контакты покупателя #{order_id}*
+
+    if order['status'] != 'pending':
+        await query.answer(f"❌ Заказ уже обработан (статус: {order['status']})", show_alert=True)
+        return
+
+    # Меняем статус заказа на подтвержденный
+    db.execute("UPDATE orders SET status = 'approved' WHERE id = ?", (order_id,))
+
+    # Меняем статус товара на "забронирован"
+    db.execute("UPDATE lots SET status = 'reserved' WHERE lot_id = ?", (order['lot_id'],))
+    lot = db.fetchone("SELECT * FROM lots WHERE lot_id = ?", (order['lot_id'],))
+    await update_channel_caption(context, lot)
+
+    # Уведомляем пользователя
+    try:
+        await context.bot.send_message(
+            order['user_id'],
+            f"✅ *Ваш заказ #{order_id} подтвержден!*\n\n"
+            f"Товар забронирован для вас.\n"
+            f"Свяжитесь с @mizirf для деталей доставки и оплаты остатка.",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Ошибка уведомления пользователя: {e}")
+
+    # Обновляем сообщение с уведомлением
+    await query.edit_message_caption(
+        caption=query.message.caption + f"\n\n✅ *Бронь подтверждена администратором*",
+        parse_mode='Markdown',
+        reply_markup=None
+    )
+
+    await query.answer("✅ Бронь успешно подтверждена")
+
+
+async def admin_reject_order(update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: int):
+    """Отклонить бронь через кнопку в уведомлении"""
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if user_id not in ADMIN_IDS:
+        await query.answer("⛔ У вас нет прав для этого действия", show_alert=True)
+        return
+
+    order = db.fetchone("SELECT * FROM orders WHERE id = ?", (order_id,))
+
+    if not order:
+        await query.answer("❌ Заказ не найден", show_alert=True)
+        return
+
+    if order['status'] != 'pending':
+        await query.answer(f"❌ Заказ уже обработан (статус: {order['status']})", show_alert=True)
+        return
+
+    # Меняем статус заказа на отклоненный
+    db.execute("UPDATE orders SET status = 'rejected' WHERE id = ?", (order_id,))
+
+    # Товар остается доступным
+    # Не меняем статус товара - он остается доступным
+
+    # Уведомляем пользователя
+    try:
+        await context.bot.send_message(
+            order['user_id'],
+            f"❌ *Ваш заказ #{order_id} отклонен.*\n\n"
+            f"Причина: неверный скриншот оплаты.\n"
+            f"Товар снова доступен для покупки.\n"
+            f"Если это ошибка, свяжитесь с @mizirf.",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Ошибка уведомления пользователя: {e}")
+
+    # Обновляем сообщение с уведомлением
+    await query.edit_message_caption(
+        caption=query.message.caption + f"\n\n❌ *Бронь отклонена администратором*",
+        parse_mode='Markdown',
+        reply_markup=None
+    )
+
+    await query.answer("❌ Бронь отклонена")
+
+
+async def admin_contact_order(update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: int):
+    """Связаться с покупателем через кнопку в уведомлении"""
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if user_id not in ADMIN_IDS:
+        await query.answer("⛔ У вас нет прав для этого действия", show_alert=True)
+        return
+
+    order = db.fetchone("SELECT * FROM orders WHERE id = ?", (order_id,))
+
+    if not order:
+        await query.answer("❌ Заказ не найден", show_alert=True)
+        return
+
+    # Показываем информацию для связи с покупателем
+    contact_info = f"""
+📞 *Контакты покупателя для заказа #{order_id}:*
+
 👤 *Имя:* {order['user_name']}
 🆔 *ID:* {order['user_id']}
 📱 *Username:* @{order['user_username'] or 'не указан'}
-💬 *Ссылка:* [Написать](tg://user?id={order['user_id']})"""
-    await edit_message_smart(query, contact_info, reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("✉️ Написать", url=f"tg://user?id={order['user_id']}")],
-        [InlineKeyboardButton("← Назад", callback_data=f"admin_approve_{order_id}")]
-    ]), parse_mode='Markdown')
 
-async def view_buyback_requests(update, context):
+💬 *Для связи:*
+• Написать в ЛС: [Написать сообщение](tg://user?id={order['user_id']})
+• Упомянуть в чате: @{order['user_username'] or 'пользователь'}
+
+📱 *Товар:* {order['lot_id']}
+💰 *Сумма заказа:* {format_price(order['price'])}₽
+    """
+
+    await edit_message_smart(
+        query,
+        contact_info,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✉️ Написать сообщение", url=f"tg://user?id={order['user_id']}")],
+            [InlineKeyboardButton("← Назад к заказу", callback_data=f"admin_approve_{order_id}")]
+        ]),
+        parse_mode='Markdown'
+    )
+
+
+async def view_buyback_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр заявок на выкуп"""
     query = update.callback_query
-    requests = db.fetchall("SELECT * FROM buyback_requests WHERE status = 'pending' ORDER BY created_at DESC LIMIT 20")
+    requests = db.fetchall('''
+        SELECT * FROM buyback_requests
+        WHERE status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 20
+    ''')
+
     if not requests:
-        await edit_message_smart(query, "📭 *Нет заявок*", reply_markup=admin_menu_keyboard(), parse_mode='Markdown')
+        await edit_message_smart(
+            query,
+            "📭 *Нет заявок на рассмотрении*",
+            reply_markup=admin_menu_keyboard(),
+            parse_mode='Markdown'
+        )
         return
+
     text = "💰 *Заявки на выкуп:*\n\n"
     for req in requests:
-        text += f"🆔 *#{req['id']}*\n📱 {req['device_model']}\n👤 {req['user_name']}\n📍 {req['location'] or 'Не указано'}\n📅 {req['created_at'][:16]}\n────────\n"
-    await edit_message_smart(query, text, reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Обновить", callback_data="view_buyback_requests")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="admin_panel")]
-    ]), parse_mode='Markdown')
+        text += f"🆔 *#{req['id']}*\n"
+        text += f"📱 {req['device_model']}\n"
+        text += f"👤 {req['user_name']}\n"
+        text += f"📍 {req['location'] or 'Не указано'}\n"
+        text += f"📅 {req['created_at'][:16]}\n"
+        text += "────────────────────\n\n"
 
-async def show_stats(update, context):
+    await edit_message_smart(
+        query,
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Обновить", callback_data="view_buyback_requests")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="admin_panel")]
+        ]),
+        parse_mode='Markdown'
+    )
+
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     stats = {
         'users': db.fetchone("SELECT COUNT(*) as c FROM users")['c'],
@@ -1351,191 +2032,455 @@ async def show_stats(update, context):
         'buyback_requests': db.fetchone("SELECT COUNT(*) as c FROM buyback_requests")['c'],
         'pending_buyback': db.fetchone("SELECT COUNT(*) as c FROM buyback_requests WHERE status='pending'")['c'],
     }
+
     text = "📊 *Статистика:*\n\n"
-    text += f"👥 Пользователей: {stats['users']}\n📦 Товаров всего: {stats['lots']}\n✅ В наличии: {stats['available']}\n🔄 Забронировано: {stats['reserved']}\n❌ Продано: {stats['sold']}\n📋 Заказов всего: {stats['orders']}\n⏳ Ожидающих: {stats['pending_orders']}\n✅ Подтвержденных: {stats['approved_orders']}\n❌ Отклоненных: {stats['rejected_orders']}\n💰 Заявок на выкуп всего: {stats['buyback_requests']}\n⏳ Ожидающих: {stats['pending_buyback']}\n"
+    text += f"👥 Пользователей: {stats['users']}\n"
+    text += f"📦 Товаров всего: {stats['lots']}\n"
+    text += f"✅ В наличии: {stats['available']}\n"
+    text += f"🔄 Забронировано: {stats['reserved']}\n"
+    text += f"❌ Продано: {stats['sold']}\n"
+    text += f"📋 Заказов всего: {stats['orders']}\n"
+    text += f"⏳ Ожидающих: {stats['pending_orders']}\n"
+    text += f"✅ Подтвержденных: {stats['approved_orders']}\n"
+    text += f"❌ Отклоненных: {stats['rejected_orders']}\n"
+    text += f"💰 Заявок на выкуп всего: {stats['buyback_requests']}\n"
+    text += f"⏳ Ожидающих: {stats['pending_buyback']}\n"
+
     await edit_message_smart(query, text, reply_markup=admin_menu_keyboard(), parse_mode='Markdown')
 
-async def view_users(update, context):
+
+async def view_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     users = db.fetchall("SELECT * FROM users ORDER BY last_active DESC LIMIT 50")
+
     if not users:
-        await edit_message_smart(query, "👥 *Нет пользователей*", reply_markup=admin_menu_keyboard(), parse_mode='Markdown')
+        await edit_message_smart(query, "👥 *Нет пользователей*", reply_markup=admin_menu_keyboard(),
+                                 parse_mode='Markdown')
         return
-    text = "👥 *Последние активные пользователи:*\n\n"
+
+    text = "👥 *Последние активные пользователи (50):*\n\n"
     for u in users:
-        name = u['first_name'] + (f" {u['last_name']}" if u['last_name'] else '')
-        username = f"@{u['username']}" if u['username'] else ''
+        name = u['first_name']
+        if u['last_name']:
+            name += f" {u['last_name']}"
+        username = f"@{u['username']}" if u['username'] else ""
         text += f"{name} {username}\n🆔 ID: {u['id']}\n⏰ Активен: {u['last_active'][:16]}\n\n"
-    await edit_message_smart(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В меню", callback_data="admin_panel")]]), parse_mode='Markdown')
 
-async def show_terms(update, context):
-    query = update.callback_query
-    terms_text = """📋 *ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ* ..."""
-    await edit_message_smart(query, terms_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]]), parse_mode='Markdown')
+    await edit_message_smart(
+        query,
+        text,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В меню", callback_data="admin_panel")]]),
+        parse_mode='Markdown'
+    )
 
-async def cancel_conversation(update, context):
-    query = update.callback_query if update.callback_query else None
-    for key in list(context.user_data.keys()):
-        if any(key.startswith(prefix) for prefix in ['buyback', 'adding_lot', 'lot_', 'awaiting_screenshot']):
-            del context.user_data[key]
+
+# ========== ОБРАБОТЧИКИ СООБЩЕНИЙ ==========
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых сообщений"""
     user_id = update.effective_user.id
-    text = "❌ *Операция отменена*"
-    if query:
-        await edit_message_smart(query, text, reply_markup=main_menu_keyboard(user_id), parse_mode='Markdown')
-    else:
-        await update.message.reply_text(text, reply_markup=main_menu_keyboard(user_id), parse_mode='Markdown')
-    return ConversationHandler.END
-
-async def show_all_items(update, context):
-    query = update.callback_query
-    items = db.fetchall("SELECT * FROM lots WHERE status = 'available' ORDER BY created_at DESC LIMIT 20")
-    if not items:
-        await edit_message_smart(query, "📭 *Товаров пока нет*", reply_markup=shop_keyboard(), parse_mode='Markdown')
-        return
-    text = "🛍️ *Все товары:*\n\n"
-    for item in items:
-        emoji = CATEGORY_EMOJIS.get(item['category'], '📦')
-        text += f"{emoji} *{item['name']}*\n💰 {format_price(item['price'])}₽\n📂 {CATEGORIES.get(item['category'], item['category'])}\n🆔 `{item['lot_id']}`\n────────\n"
-    await edit_message_smart(query, text, reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛍️ В магазин", callback_data="shop")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
-    ]), parse_mode='Markdown')
-
-async def show_popular_items(update, context):
-    query = update.callback_query
-    items = db.fetchall("SELECT * FROM lots WHERE status = 'available' ORDER BY views DESC LIMIT 10")
-    if not items:
-        await edit_message_smart(query, "📭 *Товаров пока нет*", reply_markup=shop_keyboard(), parse_mode='Markdown')
-        return
-    text = "⭐ *Популярные товары:*\n\n"
-    for item in items:
-        emoji = CATEGORY_EMOJIS.get(item['category'], '📦')
-        text += f"{emoji} *{item['name']}*\n💰 {format_price(item['price'])}₽\n👀 Просмотров: {item['views']}\n🆔 `{item['lot_id']}`\n────────\n"
-    await edit_message_smart(query, text, reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛍️ В магазин", callback_data="shop")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
-    ]), parse_mode='Markdown')
-
-async def show_new_items(update, context):
-    query = update.callback_query
-    items = db.fetchall("SELECT * FROM lots WHERE status = 'available' ORDER BY created_at DESC LIMIT 10")
-    if not items:
-        await edit_message_smart(query, "📭 *Товаров пока нет*", reply_markup=shop_keyboard(), parse_mode='Markdown')
-        return
-    text = "💎 *Новинки:*\n\n"
-    for item in items:
-        emoji = CATEGORY_EMOJIS.get(item['category'], '📦')
-        text += f"{emoji} *{item['name']}*\n💰 {format_price(item['price'])}₽\n📅 Добавлен: {item['created_at'][:10]}\n🆔 `{item['lot_id']}`\n────────\n"
-    await edit_message_smart(query, text, reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛍️ В магазин", callback_data="shop")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
-    ]), parse_mode='Markdown')
-
-# ========== ОБРАБОТКА СООБЩЕНИЙ (СКРИНШОТЫ И ПРОЧЕЕ) ==========
-async def handle_text(update, context):
     if 'awaiting_screenshot' in context.user_data:
         await handle_screenshot(update, context)
         return
-    await update.message.reply_text("👋 *Используйте кнопки меню!*", parse_mode='Markdown', reply_markup=main_menu_keyboard(update.effective_user.id))
 
-async def handle_screenshot(update, context):
+    await update.message.reply_text(
+        "👋 *Я не понимаю текст. Используйте кнопки меню!*\n\n"
+        "✨ *Что вы можете сделать:*\n"
+        "• /start - Главное меню\n"
+        "• /help - Помощь\n"
+        "• /menu - Вернуться в меню",
+        parse_mode='Markdown',
+        reply_markup=main_menu_keyboard(user_id)
+    )
+
+
+async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка скриншота оплаты"""
     if not update.message.photo:
-        await update.message.reply_text("❌ *Отправьте скриншот как фото*", reply_markup=cancel_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text(
+            "❌ *Отправьте скриншот в виде фото!*\n\n"
+            "📸 *Сделайте скриншот и отправьте его как фото*",
+            parse_mode='Markdown',
+            reply_markup=cancel_keyboard()
+        )
         return
+
     lot_id = context.user_data['awaiting_screenshot']
     lot = db.fetchone("SELECT * FROM lots WHERE lot_id = ?", (lot_id,))
     if not lot:
-        await update.message.reply_text("❌ *Товар не найден*", reply_markup=main_menu_keyboard(update.effective_user.id), parse_mode='Markdown')
+        await update.message.reply_text(
+            "❌ *Товар не найден*",
+            parse_mode='Markdown',
+            reply_markup=main_menu_keyboard(update.effective_user.id)
+        )
         del context.user_data['awaiting_screenshot']
         return
+
     user = update.effective_user
     photo = update.message.photo[-1]
-    # Сохраняем скриншот локально
-    local_screenshot = await download_photo(photo.file_id, context)
-    cursor = db.execute('''INSERT INTO orders (lot_id, user_id, user_name, user_username, screenshot, status)
-                           VALUES (?,?,?,?,?,?)''',
-                        (lot_id, user.id, user.full_name, user.username, local_screenshot, 'pending'))
-    order_id = cursor.lastrowid
-    # Уведомление админам
-    for admin_id in ADMIN_IDS:
-        try:
-            text = f"🛒 *НОВЫЙ ЗАКАЗ #{order_id}!*\n📱 {lot['name']}\n💰 {format_price(lot['price'])}₽\n👤 {user.full_name} (@{user.username or ''})"
-            with open(STATIC_DIR / local_screenshot.split('/')[-1], 'rb') as f:
-                await context.bot.send_photo(admin_id, photo=f, caption=text, parse_mode='Markdown', reply_markup=admin_order_action_keyboard(order_id))
-        except Exception as e:
-            logger.error(f"Ошибка отправки админу: {e}")
-    balance = lot['price'] - DEPOSIT_FIXED
-    await update.message.reply_text(
-        f"✅ *Скриншот отправлен!*\n📋 Заказ #{order_id}\n💰 Остаток: {format_price(balance)}₽\n⏳ Ожидайте подтверждения",
-        parse_mode='Markdown', reply_markup=order_keyboard(order_id))
+
+    # Сохраняем заказ
+    try:
+        cursor = db.execute('''
+            INSERT INTO orders (lot_id, user_id, user_name, user_username, screenshot, status)
+            VALUES (?, ?, ?, ?, ?, 'pending')
+        ''', (lot_id, user.id, user.full_name, user.username, photo.file_id))
+        order_id = cursor.lastrowid
+
+        # НЕ меняем статус товара на "забронирован" - только после подтверждения менеджера
+        # Товар остается доступным до подтверждения заказа
+
+        # Уведомляем администраторов с кнопками для быстрого подтверждения
+        for admin_id in ADMIN_IDS:
+            try:
+                text = f"""
+🛒 *НОВЫЙ ЗАКАЗ #{order_id}!*
+
+📱 *Товар:* {lot['name']}
+🆔 *Артикул:* `{lot_id}`
+💰 *Цена:* {format_price(lot['price'])}₽
+💵 *Предоплата:* {DEPOSIT_FIXED}₽
+
+👤 *Покупатель:*
+• Имя: {user.full_name}
+• ID: {user.id}
+• Username: @{user.username or 'не указан'}
+
+⏰ *Время:* {datetime.now().strftime('%d.%m.%Y %H:%M')}
+                """
+
+                await context.bot.send_photo(
+                    chat_id=admin_id,
+                    photo=photo.file_id,
+                    caption=text,
+                    parse_mode='Markdown',
+                    reply_markup=admin_order_action_keyboard(order_id)
+                )
+            except Exception as e:
+                logger.error(f"Ошибка отправки админу {admin_id}: {e}")
+
+        # Отправляем подтверждение пользователю
+        balance = lot['price'] - DEPOSIT_FIXED
+        await update.message.reply_text(
+            f"✅ *Скриншот успешно отправлен!*\n\n"
+            f"📋 *Детали заказа:*\n"
+            f"🆔 Номер: #{order_id}\n"
+            f"📱 Товар: {lot['name']}\n"
+            f"💰 Стоимость: {format_price(lot['price'])}₽\n"
+            f"💵 Внесено: {DEPOSIT_FIXED}₽\n"
+            f"💳 Остаток: {format_price(balance)}₽\n\n"
+            f"⏳ *Ожидайте подтверждения менеджера (в течение 1 часа)*\n"
+            f"📞 @mizirf",
+            parse_mode='Markdown',
+            reply_markup=order_keyboard(order_id)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка сохранения заказа: {e}")
+        await update.message.reply_text(
+            "❌ *Ошибка при сохранении заказа. Попробуйте позже.*",
+            parse_mode='Markdown',
+            reply_markup=main_menu_keyboard(user.id)
+        )
+
     del context.user_data['awaiting_screenshot']
 
-async def handle_photo(update, context):
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фото"""
     if 'awaiting_screenshot' in context.user_data:
         await handle_screenshot(update, context)
+        return
+
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        "📸 *Фото получено!*\n\n"
+        "✨ *Но я не знаю, что с ним делать.*\n"
+        "Используйте кнопки меню для действий.",
+        parse_mode='Markdown',
+        reply_markup=main_menu_keyboard(user_id)
+    )
+
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+async def show_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать правила"""
+    query = update.callback_query
+    terms_text = """
+📋 *ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ*
+
+✨ *Добро пожаловать в MIZI MARKET!*
+
+*1. Основные положения:*
+• Мы продаем и выкупаем технику Apple
+• Все товары проходят проверку
+• Гарантия на все проданные устройства
+
+*2. Процесс покупки:*
+• Бронь по предоплате 500₽
+• Остаток оплачивается при получении
+• Доставка бесплатно по России
+• Срок бронирования - 24 часа
+
+*3. Процесс продажи:*
+• Бесплатная оценка устройства
+• Мгновенная оплата наличными
+• Бесплатный выезд специалиста
+• Безопасная сделка
+
+*4. Гарантии:*
+• Конфиденциальность данных
+• Защита платежей
+• Поддержка 24/7
+• Гарантия от 3 месяцев
+
+*5. Контакты:*
+• Поддержка: @mizirf
+• Время работы: 10:00-22:00 (МСК)
+
+⚠️ *Важно:*
+❌Имеется недостаток товара: невозможно установить и использовать RuStore
+
+💎 *Спасибо, что выбираете MIZI MARKET!*
+    """
+    await edit_message_smart(
+        query,
+        terms_text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
+        ]),
+        parse_mode='Markdown'
+    )
+
+
+async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена текущей операции"""
+    query = update.callback_query if update.callback_query else None
+    # Очищаем все данные пользователя
+    keys_to_delete = [key for key in context.user_data if
+                      key.startswith('buyback') or key.startswith('adding_lot') or key.startswith(
+                          'lot_') or key == 'awaiting_screenshot']
+    for key in keys_to_delete:
+        del context.user_data[key]
+
+    user_id = update.effective_user.id
+    text = "❌ *Операция отменена*\n\n🏠 *Возврат в главное меню*"
+
+    if query:
+        await edit_message_smart(query, text, reply_markup=main_menu_keyboard(user_id), parse_mode='Markdown')
     else:
-        await update.message.reply_text("📸 *Фото получено, но я не знаю, что с ним делать*", parse_mode='Markdown', reply_markup=main_menu_keyboard(update.effective_user.id))
+        await update.message.reply_text(text, parse_mode='Markdown', reply_markup=main_menu_keyboard(user_id))
+    return ConversationHandler.END
 
-# ========== ЗАПУСК ==========
+
+async def show_all_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать все товары"""
+    query = update.callback_query
+    items = db.fetchall('''
+        SELECT * FROM lots
+        WHERE status = 'available'
+        ORDER BY created_at DESC
+        LIMIT 20
+    ''')
+
+    if not items:
+        await edit_message_smart(
+            query,
+            "📭 *Товаров пока нет*\n\n"
+            "✨ *Скоро появятся новые устройства!*",
+            reply_markup=shop_keyboard(),
+            parse_mode='Markdown'
+        )
+        return
+
+    text = "🛍️ *Все товары:*\n\n"
+    for item in items:
+        emoji = CATEGORY_EMOJIS.get(item['category'], '📦')
+        text += f"{emoji} *{item['name']}*\n"
+        text += f"💰 {format_price(item['price'])}₽\n"
+        text += f"📂 {CATEGORIES.get(item['category'], item['category'])}\n"
+        text += f"🆔 `{item['lot_id']}`\n"
+        text += "────────────────────\n\n"
+
+    await edit_message_smart(
+        query,
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛍️ В магазин", callback_data="shop")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
+        ]),
+        parse_mode='Markdown'
+    )
+
+
+async def show_popular_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать популярные товары"""
+    query = update.callback_query
+    items = db.fetchall('''
+        SELECT * FROM lots
+        WHERE status = 'available'
+        ORDER BY views DESC
+        LIMIT 10
+    ''')
+
+    if not items:
+        await edit_message_smart(
+            query,
+            "📭 *Товаров пока нет*",
+            reply_markup=shop_keyboard(),
+            parse_mode='Markdown'
+        )
+        return
+
+    text = "⭐ *Популярные товары:*\n\n"
+    for item in items:
+        emoji = CATEGORY_EMOJIS.get(item['category'], '📦')
+        text += f"{emoji} *{item['name']}*\n"
+        text += f"💰 {format_price(item['price'])}₽\n"
+        text += f"👀 Просмотров: {item['views']}\n"
+        text += f"🆔 `{item['lot_id']}`\n"
+        text += "────────────────────\n\n"
+
+    await edit_message_smart(
+        query,
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛍️ В магазин", callback_data="shop")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
+        ]),
+        parse_mode='Markdown'
+    )
+
+
+async def show_new_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать новинки"""
+    query = update.callback_query
+    items = db.fetchall('''
+        SELECT * FROM lots
+        WHERE status = 'available'
+        ORDER BY created_at DESC
+        LIMIT 10
+    ''')
+
+    if not items:
+        await edit_message_smart(
+            query,
+            "📭 *Товаров пока нет*",
+            reply_markup=shop_keyboard(),
+            parse_mode='Markdown'
+        )
+        return
+
+    text = "💎 *Новинки:*\n\n"
+    for item in items:
+        emoji = CATEGORY_EMOJIS.get(item['category'], '📦')
+        text += f"{emoji} *{item['name']}*\n"
+        text += f"💰 {format_price(item['price'])}₽\n"
+        text += f"📅 Добавлен: {item['created_at'][:10]}\n"
+        text += f"🆔 `{item['lot_id']}`\n"
+        text += "────────────────────\n\n"
+
+    await edit_message_smart(
+        query,
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛍️ В магазин", callback_data="shop")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
+        ]),
+        parse_mode='Markdown'
+    )
+
+
+# ========== СОЗДАНИЕ ПРИЛОЖЕНИЯ ==========
 def main():
-    application = Application.builder().token(TOKEN).build()
+    """Основная функция запуска бота"""
+    try:
+        # Создаем приложение
+        application = Application.builder().token(TOKEN).build()
 
-    # Conversation handlers
-    sell_conversation = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_buyback_conversation, pattern='^sell_device$')],
-        states={
-            DEVICE_MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device_model)],
-            DEVICE_CONDITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device_condition)],
-            DEVICE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device_description)],
-            DEVICE_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device_location)],
-            DEVICE_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device_contact)],
-            DEVICE_PHOTOS: [
-                MessageHandler(filters.PHOTO, handle_device_photos),
-                CallbackQueryHandler(finish_buyback_without_photos, pattern='^skip_photos$'),
-                CallbackQueryHandler(finish_buyback, pattern='^finish_photos$')
-            ],
-        },
-        fallbacks=[CallbackQueryHandler(cancel_conversation, pattern='^cancel$'), CommandHandler('cancel', cancel_conversation)]
-    )
-    application.add_handler(sell_conversation)
+        # ========== HANDLERS ==========
+        # Команды
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("menu", menu_command))
 
-    add_lot_conversation = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_add_lot_conversation, pattern='^add_lot$')],
-        states={
-            LOT_CATEGORY: [CallbackQueryHandler(handle_lot_category, pattern='^add_cat_')],
-            LOT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_lot_name)],
-            LOT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_lot_price)],
-            LOT_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_lot_description)],
-            LOT_PHOTOS: [
-                MessageHandler(filters.PHOTO, handle_lot_photos),
-                CallbackQueryHandler(finish_add_lot, pattern='^finish_photos$')
-            ],
-        },
-        fallbacks=[CallbackQueryHandler(cancel_conversation, pattern='^cancel$'), CommandHandler('cancel', cancel_conversation)]
-    )
-    application.add_handler(add_lot_conversation)
+        # Conversation Handlers
+        # Обработчик продажи устройства
+        sell_conversation = ConversationHandler(
+            entry_points=[CallbackQueryHandler(start_buyback_conversation, pattern='^sell_device$')],
+            states={
+                DEVICE_MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device_model)],
+                DEVICE_CONDITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device_condition)],
+                DEVICE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device_description)],
+                DEVICE_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device_location)],
+                DEVICE_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device_contact)],
+                DEVICE_PHOTOS: [
+                    MessageHandler(filters.PHOTO, handle_device_photos),
+                    CallbackQueryHandler(finish_buyback_without_photos, pattern='^skip_photos$'),
+                    CallbackQueryHandler(finish_buyback_with_photos, pattern='^finish_photos$')
+                ],
+            },
+            fallbacks=[
+                CallbackQueryHandler(cancel_conversation, pattern='^cancel$'),
+                CommandHandler('cancel', cancel_conversation)
+            ]
+        )
+        application.add_handler(sell_conversation)
 
-    search_conversation = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_search, pattern='^search$')],
-        states={SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search)]},
-        fallbacks=[CallbackQueryHandler(cancel_conversation, pattern='^cancel_search$'),
-                   CallbackQueryHandler(cancel_conversation, pattern='^cancel$'),
-                   CommandHandler('cancel', cancel_conversation)]
-    )
-    application.add_handler(search_conversation)
+        # Обработчик добавления товара (только для админов)
+        add_lot_conversation = ConversationHandler(
+            entry_points=[CallbackQueryHandler(start_add_lot_conversation, pattern='^add_lot$')],
+            states={
+                LOT_CATEGORY: [CallbackQueryHandler(handle_lot_category, pattern='^add_cat_')],
+                LOT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_lot_name)],
+                LOT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_lot_price)],
+                LOT_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_lot_description)],
+                LOT_PHOTOS: [
+                    MessageHandler(filters.PHOTO, handle_lot_photos),
+                    CallbackQueryHandler(finish_add_lot, pattern='^finish_photos$')
+                ],
+            },
+            fallbacks=[
+                CallbackQueryHandler(cancel_conversation, pattern='^cancel$'),
+                CommandHandler('cancel', cancel_conversation)
+            ]
+        )
+        application.add_handler(add_lot_conversation)
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("menu", menu_command))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo))
+        # Обработчик поиска товаров
+        search_conversation = ConversationHandler(
+            entry_points=[CallbackQueryHandler(start_search, pattern='^search$')],
+            states={
+                SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search)]
+            },
+            fallbacks=[
+                CallbackQueryHandler(cancel_conversation, pattern='^cancel_search$'),
+                CallbackQueryHandler(cancel_conversation, pattern='^cancel$'),
+                CommandHandler('cancel', cancel_conversation)
+            ]
+        )
+        application.add_handler(search_conversation)
 
-    # Запуск Flask в отдельном потоке
-    flask_thread = Thread(target=run_flask)
-    flask_thread.start()
-    logger.info("🚀 Бот и API запущены")
-    application.run_polling()
+        # Callback Query Handler
+        application.add_handler(CallbackQueryHandler(handle_callback))
+
+        # Message Handlers
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+        application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo))
+
+        # ========== ЗАПУСК БОТА ==========
+        logger.info("✨ Бот MIZI MARKET запущен!")
+        print("=" * 50)
+        print("🤖 Бот успешно запущен!")
+        print(f"👤 Администраторы: {ADMIN_IDS}")
+        print(f"📢 Канал: {CHANNEL_ID}")
+        print("=" * 50)
+
+        application.run_polling()
+    except Exception as e:
+        logger.error(f"Ошибка запуска бота: {e}", exc_info=True)
+        print(f"❌ Ошибка запуска бота: {e}")
+    finally:
+        db.close()
+
 
 if __name__ == "__main__":
     main()
